@@ -8,22 +8,106 @@ use crate::checkin;
 use crate::credentials;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    credential_status, Account, AppSettings, CheckinLog, CheckinResult, Credential, LaunchResult,
-    PartialAppSettings, PointsResult, PublicAccount,
+    credential_status, Account, AccountSource, AppSettings, CheckinLog, CheckinResult, Credential,
+    JwtCredential, LaunchResult, PartialAppSettings, PointsResult, PublicAccount,
 };
 use crate::scheduler;
-use crate::store::{generate_id, AppState};
+use crate::store::{effective_user_id, generate_id, AppState};
 use crate::trae_auth;
 use crate::trae_instance;
 use crate::trae_machine;
 
 #[tauri::command]
 pub fn get_accounts(state: State<'_, AppState>) -> Vec<PublicAccount> {
-    let data = state.data.lock().unwrap();
-    data.get_accounts()
-        .iter()
-        .cloned()
-        .map(PublicAccount::from)
+    build_account_views(&state)
+}
+
+/// 构建账号视图:聚合 device_map / 冷却 / 剩余积分 / JWT 状态 / 今日签到(对应参考 build_account_views)。
+fn build_account_views(state: &AppState) -> Vec<PublicAccount> {
+    use std::collections::HashSet;
+    let now_ts = chrono::Utc::now().timestamp();
+    let device_map = crate::device_map::load_device_map(state);
+    let cooldowns = crate::cooldown::all_cooldowns(state, now_ts);
+    let rc: crate::models::RemainingCreditsFile =
+        crate::fs_utils::read_json(&state.data_path("remaining_credits.json"));
+    let summary: crate::models::CheckinSummary =
+        crate::fs_utils::read_json(&state.data_path("checkin_summary.json"));
+    let today = crate::fs_utils::today_prefix();
+    let summary_today = summary
+        .time
+        .as_deref()
+        .map(|t| t.starts_with(&today))
+        .unwrap_or(false);
+    let checked_names: HashSet<String> = if summary_today {
+        summary
+            .results
+            .iter()
+            .filter(|r| {
+                let ok = r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+                ok || r.get("message").and_then(|v| v.as_str()).is_some()
+            })
+            .filter_map(|r| r.get("name").and_then(|v| v.as_str()).map(String::from))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    let accounts: Vec<Account> = {
+        let data = state.data.lock().unwrap();
+        data.get_accounts().to_vec()
+    };
+
+    accounts
+        .into_iter()
+        .map(|mut a| {
+            let uid_owned = effective_user_id(&a).map(String::from);
+            if let Some(uid) = uid_owned.as_deref() {
+                // JWT 过期状态(仅 jwt 账号)
+                if a.source == AccountSource::Jwt {
+                    if let Some(sec) = a
+                        .encrypted_jwt
+                        .as_deref()
+                        .and_then(|e| credentials::decrypt_jwt_secret(e).ok())
+                    {
+                        let info = crate::jwt::parse(&sec.jwt);
+                        a.jwt_exp_timestamp = info.exp_timestamp;
+                        a.jwt_status = Some(crate::jwt::status_of(info.exp_hours).to_string());
+                        let has_rt = sec
+                            .refresh_token
+                            .as_deref()
+                            .map(|r| !r.is_empty())
+                            .unwrap_or(false);
+                        a.has_refresh_token = has_rt;
+                        a.jwt_auto_refresh = has_rt
+                            && info.exp_hours.map(|h| h <= 24.0).unwrap_or(true);
+                    }
+                } else if let Some(status) = a.credential_status.clone() {
+                    a.jwt_status = Some(status);
+                }
+                // 剩余积分 / 过期时间
+                a.remaining_credits = rc.credits.get(uid).copied();
+                a.credits_expire_at = rc.expire_times.get(uid).copied();
+                // 设备标识(脱敏)
+                a.device_id_masked =
+                    device_map.get(uid).map(|d| crate::fs_utils::mask(&d.device_id));
+                // 冷却状态
+                if let Some((_, entry)) = cooldowns.iter().find(|(u, _)| u == uid) {
+                    a.cooldown_type = Some(entry.error_type.clone());
+                    a.cooldown_until = Some(entry.until);
+                    a.cooldown_reason =
+                        if entry.reason.is_empty() { None } else { Some(entry.reason.clone()) };
+                }
+                // 今日签到
+                a.checked_today = Some(summary_today && checked_names.contains(&a.name));
+                // 积分展示:优先 remaining_credits → credits_history → 既有值
+                if let Some(c) = rc.credits.get(uid) {
+                    a.points = Some(*c as i64);
+                } else if let Some(c) = crate::credits::latest_credits_of(state, uid) {
+                    a.points = Some(c);
+                }
+            }
+            a.into()
+        })
         .collect()
 }
 
@@ -49,6 +133,8 @@ pub fn import_desktop_account(state: State<'_, AppState>) -> AppResult<PublicAcc
         credential_status: Some(status.to_string()),
         data_dir: None,
         machine_id: None,
+        source: AccountSource::Desktop,
+        ..Default::default()
     };
     let mut data = state.data.lock().unwrap();
     let saved = data.upsert_desktop_account(account);
@@ -63,6 +149,46 @@ pub fn update_account(
     state: State<'_, AppState>,
 ) -> AppResult<PublicAccount> {
     let mut data = state.data.lock().unwrap();
+    // jwt 账号:更新 jwt/refreshToken 时重新加密写回 encrypted_jwt,并同步 user_id
+    let current = data
+        .get_accounts()
+        .iter()
+        .find(|a| a.id == id)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(id.clone()))?;
+    let mut updates = updates;
+    if current.source == AccountSource::Jwt {
+        let mut sec = current
+            .encrypted_jwt
+            .as_deref()
+            .and_then(|e| credentials::decrypt_jwt_secret(e).ok())
+            .unwrap_or_else(|| JwtCredential {
+                jwt: String::new(),
+                refresh_token: None,
+            });
+        if let Some(j) = updates.get("jwt").and_then(|v| v.as_str()) {
+            let j = j.trim().to_string();
+            if !j.is_empty() {
+                let info = crate::jwt::parse(&j);
+                if let Some(uid) = info.user_id {
+                    if let Some(obj) = updates.as_object_mut() {
+                        obj.insert("user_id".into(), serde_json::json!(uid));
+                    }
+                }
+                sec.jwt = crate::jwt::normalize_full(&j);
+            }
+        }
+        if let Some(rt) = updates.get("refreshToken").and_then(|v| v.as_str()) {
+            let t = rt.trim().to_string();
+            sec.refresh_token = if t.is_empty() { None } else { Some(t) };
+        }
+        let encrypted = credentials::encrypt_jwt_secret(&sec)?;
+        if let Some(obj) = updates.as_object_mut() {
+            obj.insert("encryptedJwt".into(), serde_json::json!(encrypted));
+            obj.remove("jwt");
+            obj.remove("refreshToken");
+        }
+    }
     let acc = data
         .update_account(&id, updates)
         .ok_or_else(|| AppError::NotFound(id.clone()))?;
@@ -73,7 +199,7 @@ pub fn update_account(
 #[tauri::command]
 pub fn delete_account(id: String, state: State<'_, AppState>, app: AppHandle) -> AppResult<bool> {
     // 关闭该账号的工具实例(若在运行),数据目录保留(用户可日后通过"扫描已有多开目录"重新导入)
-    {
+    let uid_to_cleanup = {
         let data = state.data.lock().unwrap();
         if let Some(acc) = data.get_accounts().iter().find(|a| a.id == id) {
             if let Some(dir) = acc.data_dir.as_deref().filter(|s| !s.is_empty()) {
@@ -81,12 +207,21 @@ pub fn delete_account(id: String, state: State<'_, AppState>, app: AppHandle) ->
                     let _ = trae_machine::kill_instance(dir);
                 }
             }
+            effective_user_id(acc).map(|s| s.to_string())
+        } else {
+            None
         }
-    }
+    };
     let mut data = state.data.lock().unwrap();
     data.delete_account(&id);
     data.save(&state.path)?;
     drop(data);
+    // 联动清理参考式数据文件中的该账号条目(避免残留冷却/设备记录误伤重加账号)
+    if let Some(uid) = uid_to_cleanup {
+        crate::device_map::reset_device_for(&state, &uid);
+        crate::cooldown::remove_cooldown(&state, &uid);
+        crate::credits::remove_account_data(&state, &uid);
+    }
     // 刷新托盘菜单:移除已删除账号的快捷聚焦项
     let _ = crate::rebuild_tray_menu(&app);
     Ok(true)
@@ -97,21 +232,24 @@ pub async fn checkin_account(
     id: String,
     state: State<'_, AppState>,
     client: State<'_, reqwest::Client>,
+    app: AppHandle,
 ) -> AppResult<CheckinResult> {
     let account = {
         let data = state.data.lock().unwrap();
         data.get_accounts().iter().find(|a| a.id == id).cloned()
     };
     let account = account.ok_or_else(|| AppError::NotFound(id.clone()))?;
-    Ok(checkin::perform_checkin(&account, client.inner(), state.inner()).await)
+    Ok(checkin::perform_checkin(Some(&app), &account, client.inner(), state.inner()).await)
 }
 
 #[tauri::command]
 pub async fn checkin_all(
     state: State<'_, AppState>,
     client: State<'_, reqwest::Client>,
+    app: AppHandle,
 ) -> AppResult<Vec<(PublicAccount, CheckinResult)>> {
-    Ok(checkin::perform_all_checkin(client.inner(), state.inner()).await)
+    // 手动一键签到:账号间保持 2s 快速执行(自动定时签到用可配置的分钟级间隔,见 scheduler)
+    Ok(checkin::perform_all_checkin(&app, client.inner(), state.inner(), 2).await)
 }
 
 #[tauri::command]
@@ -132,6 +270,207 @@ pub async fn get_account_points(
         let _ = data.save(&state.path);
     }
     Ok(result)
+}
+
+/// 按 user_id 查找账号
+fn find_by_user_id(state: &AppState, user_id: &str) -> Option<Account> {
+    let data = state.data.lock().unwrap();
+    data.get_accounts()
+        .iter()
+        .find(|a| {
+            effective_user_id(a).map(|u| u == user_id).unwrap_or(false)
+                || a.desktop_user_id.as_deref() == Some(user_id)
+        })
+        .cloned()
+}
+
+/// 手动录入 JWT 账号(参考模式):解析 user_id -> 查重 -> DPAPI 加密 -> 保存
+#[tauri::command]
+pub fn account_add_jwt(
+    state: State<'_, AppState>,
+    name: String,
+    jwt: String,
+    refresh_token: Option<String>,
+    enabled: Option<bool>,
+) -> AppResult<PublicAccount> {
+    let info = crate::jwt::parse(&jwt);
+    let uid = info
+        .user_id
+        .ok_or_else(|| AppError::Credential("无法从 JWT 解析 user_id,请检查格式".into()))?;
+    let mut data = state.data.lock().unwrap();
+    if data.get_accounts().iter().any(|a| {
+        a.desktop_user_id.as_deref() == Some(uid.as_str())
+            || a.user_id.as_deref() == Some(uid.as_str())
+    }) {
+        return Err(AppError::Credential("该账号已存在".into()));
+    }
+    let sec = JwtCredential {
+        jwt: crate::jwt::normalize_full(&jwt),
+        refresh_token,
+    };
+    let encrypted = credentials::encrypt_jwt_secret(&sec)?;
+    let account = Account {
+        id: generate_id(),
+        name,
+        cookie: String::new(),
+        created_at: now_ms(),
+        enabled: enabled.unwrap_or(true),
+        source: AccountSource::Jwt,
+        user_id: Some(uid.clone()),
+        encrypted_jwt: Some(encrypted),
+        ..Default::default()
+    };
+    let saved = data.upsert_desktop_account(account);
+    let _ = data.save(&state.path);
+    Ok(saved.into())
+}
+
+/// JWT 解析预览(弹窗实时显示 user_id / 剩余小时)
+#[tauri::command]
+pub fn jwt_parse_preview(jwt: String) -> Result<crate::jwt::JwtInfo, String> {
+    let info = crate::jwt::parse(&jwt);
+    if info.user_id.is_none() {
+        return Err("无法从 JWT 解析 user_id,请检查格式".into());
+    }
+    Ok(info)
+}
+
+/// 手动刷新 jwt 账号的 JWT(refresh_token -> ExchangeToken),返回更新后账号
+#[tauri::command]
+pub async fn refresh_jwt_account(
+    user_id: String,
+    state: State<'_, AppState>,
+    client: State<'_, reqwest::Client>,
+) -> AppResult<PublicAccount> {
+    let account =
+        find_by_user_id(&state, &user_id).ok_or_else(|| AppError::NotFound(user_id.clone()))?;
+    if account.source != AccountSource::Jwt {
+        return Err(AppError::Credential("仅 JWT 账号可手动刷新".into()));
+    }
+    let _guard = state.jwt_refresh_lock.lock().await;
+    // 持锁后重读(防并发)
+    let current = find_by_user_id(&state, &user_id)
+        .ok_or_else(|| AppError::NotFound(user_id.clone()))?;
+    let enc = current
+        .encrypted_jwt
+        .as_deref()
+        .ok_or_else(|| AppError::Credential("该账号无 JWT 凭据".into()))?;
+    let sec = credentials::decrypt_jwt_secret(enc)?;
+    let rt = sec
+        .refresh_token
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::Credential("该账号无 refresh_token,无法自动刷新".into()))?
+        .to_string();
+    let (new_jwt, new_rt) = crate::jwt::exchange_token(&rt, client.inner())
+        .await
+        .map_err(AppError::Credential)?;
+    // 校验 user_id 一致
+    let new_uid = crate::jwt::parse(&new_jwt).user_id;
+    if let Some(nu) = new_uid.as_deref() {
+        if nu != user_id {
+            return Err(AppError::Credential(format!(
+                "刷新后 user_id 不匹配: 期望={user_id}, 实际={nu}"
+            )));
+        }
+    }
+    let mut sec2 = sec;
+    sec2.jwt = new_jwt;
+    if let Some(rt2) = new_rt {
+        sec2.refresh_token = Some(rt2);
+    }
+    let encrypted = credentials::encrypt_jwt_secret(&sec2)?;
+    let mut data = state.data.lock().unwrap();
+    let acc = data
+        .update_account(
+            &current.id,
+            serde_json::json!({ "encryptedJwt": encrypted, "user_id": new_uid }),
+        )
+        .ok_or_else(|| AppError::NotFound(current.id.clone()))?;
+    let _ = data.save(&state.path);
+    Ok(acc.into())
+}
+
+/// 清除单个账号冷却状态
+#[tauri::command]
+pub fn cooldown_clear(state: State<'_, AppState>, user_id: String) -> AppResult<()> {
+    crate::cooldown::clear_cooldown(&state, &user_id);
+    Ok(())
+}
+
+/// 清除所有账号冷却状态
+#[tauri::command]
+pub fn cooldown_clear_all(state: State<'_, AppState>) -> AppResult<usize> {
+    Ok(crate::cooldown::clear_all_cooldowns(&state))
+}
+
+/// 重置某账号的伪设备身份(下次签到重新派生)
+#[tauri::command]
+pub fn device_reset(state: State<'_, AppState>, user_id: String) -> AppResult<()> {
+    crate::device_map::reset_device_for(&state, &user_id);
+    Ok(())
+}
+
+/// 实时查询某账号剩余积分(写 remaining_credits.json 缓存)
+#[tauri::command]
+pub async fn fetch_remaining_credits(
+    user_id: String,
+    state: State<'_, AppState>,
+    client: State<'_, reqwest::Client>,
+) -> AppResult<f64> {
+    let account =
+        find_by_user_id(&state, &user_id).ok_or_else(|| AppError::NotFound(user_id.clone()))?;
+    let jwt = crate::credits::resolve_account_jwt(&account)
+        .ok_or_else(|| AppError::Credential("账号无可用凭据".into()))?;
+    let (credits, expire_at, _) =
+        crate::credits::calc_remaining_credits(&jwt, client.inner())
+            .await
+            .map_err(AppError::Credential)?;
+    let mut rc: crate::models::RemainingCreditsFile =
+        crate::fs_utils::read_json(&state.data_path("remaining_credits.json"));
+    rc.credits.insert(user_id.clone(), credits);
+    if let Some(exp) = expire_at {
+        rc.expire_times.insert(user_id.clone(), exp);
+    }
+    rc.updated_at = Some(crate::fs_utils::now_iso());
+    let _ = crate::fs_utils::write_json(&state.data_path("remaining_credits.json"), &rc);
+    Ok(credits)
+}
+
+/// 刷新所有账号剩余积分(含自动解冻)
+#[tauri::command]
+pub async fn refresh_all_remaining_credits(
+    state: State<'_, AppState>,
+    client: State<'_, reqwest::Client>,
+) -> AppResult<usize> {
+    Ok(crate::credits::refresh_remaining_credits(&state, client.inner())
+        .await
+        .map_err(AppError::Credential)?)
+}
+
+/// 每日积分快照列表(积分看板三线趋势数据源)
+#[tauri::command]
+pub fn credits_daily_list(
+    state: State<'_, AppState>,
+) -> Vec<crate::models::CreditsDailySnapshot> {
+    crate::fs_utils::read_json(&state.data_path("credits_daily.json"))
+}
+
+/// 用系统默认浏览器打开外部链接(关于页"项目地址"用)
+#[tauri::command]
+pub fn open_url(url: String) -> AppResult<()> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "", &url])
+            .spawn()
+            .map_err(|e| AppError::Launch(format!("打开链接失败: {e}")))?;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = url;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -558,6 +897,8 @@ fn wait_login_and_import(app: &AppHandle, appdata: &str, temp_dir: &str) -> serd
         credential_status: Some(status.to_string()),
         data_dir: Some(target_dir.to_string_lossy().to_string()),
         machine_id: Some(cred.machine_id.clone()),
+        source: AccountSource::Desktop,
+        ..Default::default()
     };
     {
         let state = app.state::<AppState>();
@@ -682,6 +1023,8 @@ pub fn import_account_from_dir(
                 credential_status: Some(status.to_string()),
                 data_dir: Some(data_dir.clone()),
                 machine_id,
+                source: AccountSource::Desktop,
+                ..Default::default()
             };
             data.upsert_desktop_account(account)
         }

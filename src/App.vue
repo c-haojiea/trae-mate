@@ -99,7 +99,10 @@
             v-if="activeTab === 'accounts'"
           >
             <span v-if="store.checkingIn" class="spinner"></span>
-            <span>{{ store.checkingIn ? '签到中...' : '一键签到全部' }}</span>
+            <span v-if="store.checkingIn && store.checkinTotal > 0">
+              签到中... {{ store.progressDone }}/{{ store.checkinTotal }}
+            </span>
+            <span v-else>{{ store.checkingIn ? '签到中...' : '一键签到全部' }}</span>
           </button>
           <button
             class="btn btn-primary"

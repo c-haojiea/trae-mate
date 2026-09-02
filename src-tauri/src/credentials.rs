@@ -78,6 +78,25 @@ pub fn decrypt_credential(encoded: &str) -> AppResult<Credential> {
     Ok(cred)
 }
 
+// ===== JWT 账号凭据加密(与 Credential 同构,复用 DPAPI) =====
+
+/// 加密 JWT 账号凭据(jwt + refresh_token),DPAPI -> base64
+pub fn encrypt_jwt_secret(sec: &crate::models::JwtCredential) -> AppResult<String> {
+    let json = serde_json::to_string(sec)?;
+    let bytes = dpapi_protect(json.as_bytes())?;
+    Ok(general_purpose::STANDARD.encode(&bytes))
+}
+
+/// 解密 JWT 账号凭据
+pub fn decrypt_jwt_secret(encoded: &str) -> AppResult<crate::models::JwtCredential> {
+    let bytes = general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| AppError::Credential(format!("base64 解码失败: {e}")))?;
+    let plain = dpapi_unprotect(&bytes)?;
+    let sec: crate::models::JwtCredential = serde_json::from_slice(&plain)?;
+    Ok(sec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

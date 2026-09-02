@@ -38,3 +38,6 @@ desktop.ini
 
 # ---- Legacy backup (has its own git repo) ----
 trae-check-orig/
+
+# ---- Reference project source (TraeWorkAssistant, not part of this repo) ----
+.reference/

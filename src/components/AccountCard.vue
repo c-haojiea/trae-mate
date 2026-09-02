@@ -34,7 +34,7 @@
         <span class="info-label">添加时间</span>
         <span class="info-value">{{ formatDate(account.createdAt) }}</span>
       </div>
-      <div class="info-row" v-if="account.credentialStatus">
+      <div class="info-row" v-if="account.source !== 'jwt' && account.credentialStatus">
         <span class="info-label">桌面凭证</span>
         <span class="cred-value-wrap">
           <span class="info-value" :class="account.credentialStatus === 'expired' ? 'text-danger' : 'text-success'">
@@ -50,6 +50,30 @@
           </button>
         </span>
       </div>
+      <div class="info-row" v-if="isJwt">
+        <span class="info-label">JWT 状态</span>
+        <span class="cred-value-wrap">
+          <span class="info-value" :class="jwtStatusClass">{{ jwtStatusText }}</span>
+          <button
+            v-if="account.hasRefreshToken"
+            class="btn-refresh-cred"
+            title="用 refresh_token 自动刷新 JWT"
+            @click="handleRefreshJwt"
+            :disabled="refreshingJwt"
+          >
+            <Icon name="arrow-path" :size="11" :class="{ spinning: refreshingJwt }" />
+          </button>
+        </span>
+      </div>
+      <div class="info-row" v-if="account.cooldownType">
+        <span class="info-label">冷却中</span>
+        <span class="cred-value-wrap">
+          <span class="info-value text-danger">{{ cooldownText }}</span>
+          <button class="btn-refresh-cred" title="清除冷却状态" @click="handleClearCooldown">
+            <Icon name="x-mark" :size="11" />
+          </button>
+        </span>
+      </div>
     </div>
 
     <!-- 卡片底部 -->
@@ -62,24 +86,26 @@
         <span v-if="checkingIn" class="spinner"></span>
         <span>{{ checkingIn ? '签到中' : '立即签到' }}</span>
       </button>
-      <button
-        v-if="instanceState.source === 'none'"
-        class="btn btn-sm btn-outline"
-        @click="handleLaunchMulti"
-        :disabled="launching"
-        :title="account.dataDir ? '启动该账号的独立实例' : '首次启动:创建独立实例并启动'"
-      >
-        <span v-if="launching" class="spinner"></span>
-        <span>{{ launching ? '程序正在启动,请稍后' : '启动' }}</span>
-      </button>
-      <button
-        v-else
-        class="btn btn-sm btn-outline"
-        @click="handleFocus"
-        :title="instanceState.source === 'main' ? '该账号在主实例运行,点击聚焦主实例窗口' : '该账号工具实例已运行,点击聚焦其窗口'"
-      >
-        <span>聚焦</span>
-      </button>
+      <template v-if="!isJwt">
+        <button
+          v-if="instanceState.source === 'none'"
+          class="btn btn-sm btn-outline"
+          @click="handleLaunchMulti"
+          :disabled="launching"
+          :title="account.dataDir ? '启动该账号的独立实例' : '首次启动:创建独立实例并启动'"
+        >
+          <span v-if="launching" class="spinner"></span>
+          <span>{{ launching ? '程序正在启动,请稍后' : '启动' }}</span>
+        </button>
+        <button
+          v-else
+          class="btn btn-sm btn-outline"
+          @click="handleFocus"
+          :title="instanceState.source === 'main' ? '该账号在主实例运行,点击聚焦主实例窗口' : '该账号工具实例已运行,点击聚焦其窗口'"
+        >
+          <span>聚焦</span>
+        </button>
+      </template>
       <button type="button" class="btn btn-sm btn-outline" @click.stop="startEdit">
         编辑
       </button>
@@ -111,7 +137,10 @@ const store = useAppStore()
 const checkingIn = ref(false)
 const launching = ref(false)
 const refreshingCred = ref(false)
+const refreshingJwt = ref(false)
 const instanceState = ref<InstanceState>({ running: false, source: 'none', isMainAccount: false })
+
+const isJwt = computed(() => props.account.source === 'jwt')
 
 onMounted(async () => {
   instanceState.value = await store.getInstanceState(props.account.id)
@@ -159,6 +188,35 @@ const credentialStatusText = computed(() => {
   if (props.account.credentialStatus === 'expired') return '凭证已失效，请打开 TRAE 实例刷新'
   if (props.account.credentialStatus === 'expiring') return '凭证即将过期，打开 TRAE 实例续期'
   return '凭证有效'
+})
+
+const jwtStatusClass = computed(() => {
+  switch (props.account.jwtStatus) {
+    case 'ok': return 'text-success'
+    case 'warn': return 'text-warning'
+    case 'expired': return 'text-danger'
+    default: return ''
+  }
+})
+
+const jwtStatusText = computed(() => {
+  const status = props.account.jwtStatus
+  if (status === 'expired') return 'JWT 已过期'
+  if (status === 'unknown') return 'JWT 未知'
+  const h = props.account.jwtExpTimestamp
+    ? (props.account.jwtExpTimestamp - Date.now() / 1000) / 3600
+    : null
+  if (status === 'warn' && h != null) return `JWT ${h.toFixed(1)}h 后过期`
+  return 'JWT 有效'
+})
+
+const cooldownText = computed(() => {
+  const t = props.account.cooldownType
+  const until = props.account.cooldownUntil || 0
+  const reason = props.account.cooldownReason
+  if (until >= 9999999999) return `${t}：永久冷却（需重新登录/刷新凭证）`
+  const mins = Math.ceil((until - Date.now() / 1000) / 60)
+  return `${t}${reason ? '：' + reason : ''} · 剩余 ${Math.max(mins, 0)} 分钟`
 })
 
 function handleToggle() {
@@ -225,6 +283,31 @@ async function handleRefreshCred() {
     emit('notify', '回读凭证失败: ' + (e?.message || e), 'error')
   } finally {
     refreshingCred.value = false
+  }
+}
+
+// 刷新 JWT 账号令牌(refresh_token -> ExchangeToken)
+async function handleRefreshJwt() {
+  if (refreshingJwt.value || !props.account.userId) return
+  refreshingJwt.value = true
+  try {
+    await store.refreshJwt(props.account.userId)
+    emit('notify', 'JWT 已刷新', 'success')
+  } catch (e: any) {
+    emit('notify', 'JWT 刷新失败: ' + (e?.message || e), 'error')
+  } finally {
+    refreshingJwt.value = false
+  }
+}
+
+// 清除冷却状态
+async function handleClearCooldown() {
+  if (!props.account.userId) return
+  try {
+    await store.clearCooldown(props.account.userId)
+    emit('notify', '冷却已清除', 'success')
+  } catch (e: any) {
+    emit('notify', '清除冷却失败: ' + (e?.message || e), 'error')
   }
 }
 
@@ -418,6 +501,10 @@ function formatDateTime(timestamp: number): string {
 
 .text-success {
   color: var(--success);
+}
+
+.text-warning {
+  color: var(--warning);
 }
 
 .text-danger {

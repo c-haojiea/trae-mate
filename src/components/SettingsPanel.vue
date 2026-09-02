@@ -36,8 +36,27 @@
 
       <div class="setting-item">
         <div class="setting-info">
+          <span class="setting-label">账号间隔</span>
+          <span class="setting-desc">自动签到每个账号之间的冷却间隔（最短 3 分钟）</span>
+        </div>
+        <select
+          class="input select-input"
+          :value="store.settings.autoCheckinIntervalMin ?? 15"
+          @change="updateCheckinInterval"
+          :disabled="!store.settings.autoCheckin"
+        >
+          <option :value="3">3 分钟</option>
+          <option :value="5">5 分钟</option>
+          <option :value="10">10 分钟</option>
+          <option :value="15">15 分钟</option>
+          <option :value="30">30 分钟</option>
+        </select>
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
           <span class="setting-label">失败重试次数</span>
-          <span class="setting-desc">签到失败时自动重试的次数</span>
+          <span class="setting-desc">仅网络异常自动重试（业务失败不重试）</span>
         </div>
         <select
           class="input select-input"
@@ -54,19 +73,10 @@
 
       <div class="setting-item">
         <div class="setting-info">
-          <span class="setting-label">重试间隔</span>
-          <span class="setting-desc">每次重试之间的等待时间（秒）</span>
+          <span class="setting-label">网络重试间隔</span>
+          <span class="setting-desc">固定 1 秒，不可配置</span>
         </div>
-        <select
-          class="input select-input"
-          :value="store.settings.retryDelay"
-          @change="updateRetryDelay"
-        >
-          <option :value="30">30 秒</option>
-          <option :value="60">60 秒</option>
-          <option :value="120">2 分钟</option>
-          <option :value="300">5 分钟</option>
-        </select>
+        <span class="setting-value">1 秒</span>
       </div>
     </div>
 
@@ -237,6 +247,32 @@
     </div>
 
     <div class="settings-section card">
+      <h3 class="section-title">签到核心 · 参考模式</h3>
+      <p class="section-desc">签到走稳定伪设备 ID + 完整请求头 + 错误冷却状态机(仿 TraeWorkAssistant 处理模式)</p>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <span class="setting-label">刷新所有账号积分</span>
+          <span class="setting-desc">实时查询剩余积分与过期时间,并自动解冻冷却中的账号</span>
+        </div>
+        <button class="btn btn-sm btn-outline" @click="handleRefreshAllCredits" :disabled="creditsBusy">
+          <span v-if="creditsBusy" class="spinner"></span>
+          <span>{{ creditsBusy ? '刷新中...' : '刷新积分' }}</span>
+        </button>
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <span class="setting-label">清空所有冷却</span>
+          <span class="setting-desc">重置全部账号的签到错误冷却状态(SessionDead 永久冷却除外需重新登录)</span>
+        </div>
+        <button class="btn btn-sm btn-outline danger" @click="handleClearAllCooldowns">
+          清空冷却
+        </button>
+      </div>
+    </div>
+
+    <div class="settings-section card">
       <h3 class="section-title">实例启动 · TRAE 客户端路径</h3>
       <p class="section-desc">启动独立实例需要指定 TRAE Work CN 客户端(TRAE SOLO CN.exe),为每个账号启动独立实例</p>
 
@@ -275,11 +311,15 @@
       <div class="about-info">
         <div class="about-row">
           <span class="about-label">版本</span>
-          <span class="about-value">v1.1.0</span>
+          <span class="about-value">v1.2.0</span>
         </div>
         <div class="about-row">
           <span class="about-label">技术栈</span>
           <span class="about-value">Tauri 2 + Vue 3 + Vite</span>
+        </div>
+        <div class="about-row">
+          <span class="about-label">项目地址</span>
+          <a class="about-link" href="#" @click.prevent="openRepo">github.com/luckymiaow/trae-mate</a>
         </div>
         <div class="about-row">
           <span class="about-label">数据存储</span>
@@ -305,19 +345,53 @@
 <script setup lang="ts">
 import { computed, ref, onMounted } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
+import { invoke } from '@tauri-apps/api/core'
 import { useAppStore } from '../stores/app'
 import Icon from './Icon.vue'
 
 const store = useAppStore()
 const emit = defineEmits(['notify'])
 
+// 打开项目 GitHub 地址
+async function openRepo() {
+  try {
+    await invoke('open_url', { url: 'https://github.com/luckymiaow/trae-mate' })
+  } catch (e: any) {
+    emit('notify', '打开链接失败: ' + (e?.message || e), 'error')
+  }
+}
+
 // 多开实例 TRAE 客户端路径
 const traeExePath = ref<string | null>(null)
 const pathBusy = ref<'' | 'scan' | 'choose'>('')
 
+// 签到核心操作
+const creditsBusy = ref(false)
+
 onMounted(async () => {
   traeExePath.value = await store.getTraeExePath()
 })
+
+async function handleRefreshAllCredits() {
+  creditsBusy.value = true
+  try {
+    const n = await store.refreshAllCredits()
+    emit('notify', `积分刷新完成（成功 ${n} 个账号）`, 'success')
+  } catch (e: any) {
+    emit('notify', '积分刷新失败: ' + (e?.message || e), 'error')
+  } finally {
+    creditsBusy.value = false
+  }
+}
+
+async function handleClearAllCooldowns() {
+  try {
+    const n = await store.clearAllCooldowns()
+    emit('notify', `已清空 ${n} 个冷却状态`, 'success')
+  } catch (e: any) {
+    emit('notify', '清空冷却失败: ' + (e?.message || e), 'error')
+  }
+}
 
 async function scanTraePath() {
   pathBusy.value = 'scan'
@@ -380,14 +454,14 @@ async function updateCheckinTime(e: Event) {
   await store.saveSettings({ checkinTime: value })
 }
 
+async function updateCheckinInterval(e: Event) {
+  const value = parseInt((e.target as HTMLSelectElement).value)
+  await store.saveSettings({ autoCheckinIntervalMin: value })
+}
+
 async function updateRetryCount(e: Event) {
   const value = parseInt((e.target as HTMLSelectElement).value)
   await store.saveSettings({ retryCount: value })
-}
-
-async function updateRetryDelay(e: Event) {
-  const value = parseInt((e.target as HTMLSelectElement).value)
-  await store.saveSettings({ retryDelay: value })
 }
 
 async function toggleNotifySuccess() {
@@ -480,6 +554,16 @@ function formatJson(obj?: Record<string, any>): string {
 .settings-panel {
   max-width: 720px;
   margin: 0 auto;
+}
+
+/* 危险轮廓按钮(清空冷却) */
+.btn-outline.danger {
+  color: var(--danger);
+}
+
+.btn-outline.danger:hover:not(:disabled) {
+  color: var(--danger);
+  box-shadow: var(--shadow-soft-raised);
 }
 
 /* 设置分区卡片 - 凸起 */
@@ -726,6 +810,18 @@ function formatJson(obj?: Record<string, any>): string {
   font-size: 13px;
   font-weight: 600;
   color: var(--text-primary);
+}
+
+.about-link {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.about-link:hover {
+  text-decoration: underline;
 }
 
 /* 提示框 - 凹槽 + 强调色图标/标题 */

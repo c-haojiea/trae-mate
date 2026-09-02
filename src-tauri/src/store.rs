@@ -21,6 +21,29 @@ pub struct StoreData {
 pub struct AppState {
     pub data: Mutex<StoreData>,
     pub path: PathBuf,
+    /// 应用数据根目录(app_data_dir),新增参考式 JSON 文件放其 data/ 子目录
+    pub data_dir: PathBuf,
+    /// JWT 刷新锁:防止多个并发请求同时 ExchangeToken(用 tokio Mutex,持锁可跨 await)
+    pub jwt_refresh_lock: tokio::sync::Mutex<()>,
+}
+
+impl AppState {
+    /// 参考式 JSON 数据文件路径:data_dir/data/{name},自动建目录。
+    pub fn data_path(&self, name: &str) -> PathBuf {
+        let dir = self.data_dir.join("data");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(name)
+    }
+}
+
+/// 账号的有效 user_id:desktop 用 desktop_user_id,jwt 用 user_id。
+/// 用于 device_map / cooldown / credits 等按用户维度的数据文件索引。
+pub fn effective_user_id(a: &Account) -> Option<&str> {
+    match a.source {
+        crate::models::AccountSource::Jwt => a.user_id.as_deref(),
+        crate::models::AccountSource::Desktop => a.desktop_user_id.as_deref(),
+    }
+    .filter(|s| !s.is_empty())
 }
 
 impl StoreData {

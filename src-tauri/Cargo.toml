@@ -1,6 +1,6 @@
 [package]
 name = "trae-mate"
-version = "1.1.0"
+version = "1.2.0"
 description = "Trae Work 签到与多开账号管理 - Tauri2 版"
 authors = ["traemate"]
 edition = "2021"
@@ -26,7 +26,7 @@ windows = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_
 rsa = "0.9"
 rand = "0.8"
 hex = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "deflate"] }
 tokio = { version = "1", features = ["time", "macros", "rt-multi-thread"] }
 tauri-plugin-notification = "2"
 chrono-tz = "0.10"

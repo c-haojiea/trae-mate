@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 
 export interface Account {
   id: string
@@ -16,6 +17,20 @@ export interface Account {
   credentialStatus?: 'valid' | 'expiring' | 'expired'
   dataDir?: string
   machineId?: string
+  // 参考模式新增
+  source?: 'desktop' | 'jwt'
+  userId?: string
+  jwtExpTimestamp?: number
+  jwtStatus?: string // ok | warn | expired | unknown
+  hasRefreshToken?: boolean
+  jwtAutoRefresh?: boolean
+  remainingCredits?: number
+  creditsExpireAt?: number
+  deviceIdMasked?: string
+  cooldownType?: string
+  cooldownUntil?: number
+  cooldownReason?: string
+  checkedToday?: boolean
 }
 
 export interface CheckinLog {
@@ -38,6 +53,34 @@ export interface PointsResult {
   success: boolean
   message: string
   totalPoints?: number
+}
+
+export interface CheckinProgressEvent {
+  type: string
+  index?: number
+  total?: number
+  user_id?: string
+  name?: string
+  status?: string // success | fail | already | skip
+  message?: string
+  code?: number | null
+  credits?: number | null
+  delta?: number | null
+  error_type?: string
+  cooldown_until?: number
+}
+
+export interface CreditsDailySnapshot {
+  date: string
+  total: number
+  earned: number
+  consumed: number
+}
+
+export interface JwtPreview {
+  userId?: string
+  expHours?: number
+  expTimestamp?: number
 }
 
 export interface LaunchResult {
@@ -70,6 +113,8 @@ export interface AppSettings {
   checkinTime: string
   retryCount: number
   retryDelay: number
+  /** 自动签到(定时)时账号间执行间隔(分钟),最短 3 */
+  autoCheckinIntervalMin?: number
   notifyOnSuccess: boolean
   notifyOnFailed: boolean
   launchAtLogin: boolean
@@ -94,16 +139,23 @@ export const useAppStore = defineStore('app', () => {
   const waitingLogin = ref(false) // 等待新实例登录导入(打开新实例登录后置 true,login-imported 事件后置 false)
   const instanceRefreshTick = ref(0) // 多开状态刷新信号:自增触发各卡片重查
   const nextRunTime = ref<string | null>(null)
+  const checkinProgress = ref<Record<string, CheckinProgressEvent>>({}) // 一键签到实时进度(按 user_id 索引)
+  const checkinTotal = ref(0)
+  const creditsDaily = ref<CreditsDailySnapshot[]>([])
 
   // 计算属性
   const enabledAccounts = computed(() => accounts.value.filter(a => a.enabled))
   const todayCheckedCount = computed(() => {
+    // 优先参考模式的 checkedToday,回退旧 lastCheckinAt 判断
+    const checked = accounts.value.filter(a => a.checkedToday === true).length
+    if (checked > 0) return checked
     const today = new Date().toDateString()
     return accounts.value.filter(a => {
       if (!a.lastCheckinAt) return false
       return new Date(a.lastCheckinAt).toDateString() === today && a.lastCheckinResult === 'success'
     }).length
   })
+  const progressDone = computed(() => Object.keys(checkinProgress.value).length)
 
   // 方法
   async function fetchAccounts() {
@@ -324,6 +376,56 @@ export const useAppStore = defineStore('app', () => {
     return await invoke<string>('scan_trae_exe_path')
   }
 
+  // ===== 参考模式:JWT 账号 / 冷却 / 积分 =====
+
+  // 手动录入 JWT 账号
+  async function addJwtAccount(name: string, jwt: string, refreshToken?: string, enabled?: boolean) {
+    const result = await invoke('account_add_jwt', { name, jwt, refreshToken, enabled })
+    await fetchAccounts()
+    return result
+  }
+
+  // 解析 JWT 预览(弹窗实时显示 user_id / 剩余小时)
+  async function parseJwtPreview(jwt: string): Promise<JwtPreview> {
+    return await invoke<JwtPreview>('jwt_parse_preview', { jwt })
+  }
+
+  // 手动刷新 jwt 账号(refresh_token -> ExchangeToken)
+  async function refreshJwt(userId: string) {
+    const result = await invoke('refresh_jwt_account', { userId })
+    await fetchAccounts()
+    return result
+  }
+
+  // 清除单个/全部冷却
+  async function clearCooldown(userId: string) {
+    await invoke('cooldown_clear', { userId })
+    await fetchAccounts()
+  }
+  async function clearAllCooldowns() {
+    await invoke('cooldown_clear_all')
+    await fetchAccounts()
+  }
+
+  // 实时查询单个/全部账号剩余积分
+  async function fetchRemainingCredits(userId: string) {
+    const result = await invoke<number>('fetch_remaining_credits', { userId })
+    await fetchAccounts()
+    return result
+  }
+  async function refreshAllCredits() {
+    const result = await invoke<number>('refresh_all_remaining_credits')
+    await fetchAccounts()
+    return result
+  }
+
+  // 每日积分快照
+  async function fetchCreditsDaily() {
+    const result = await invoke<CreditsDailySnapshot[]>('credits_daily_list')
+    creditsDaily.value = result || []
+    return result
+  }
+
   // 初始化
   async function init() {
     loading.value = true
@@ -334,6 +436,21 @@ export const useAppStore = defineStore('app', () => {
         fetchSettings(),
         fetchNextRunTime()
       ])
+      // 一键签到实时进度事件
+      await listen<CheckinProgressEvent>('checkin-start', (e) => {
+        const ev = e.payload
+        checkinProgress.value = {}
+        checkinTotal.value = ev.total ?? 0
+      })
+      await listen<CheckinProgressEvent>('checkin-progress', (e) => {
+        const ev = e.payload
+        if (ev.type === 'account' && ev.user_id) {
+          checkinProgress.value = { ...checkinProgress.value, [ev.user_id]: ev }
+        }
+      })
+      await listen<CheckinProgressEvent>('checkin-done', async () => {
+        await Promise.all([fetchAccounts(), fetchLogs()])
+      })
     } finally {
       loading.value = false
     }
@@ -350,9 +467,13 @@ export const useAppStore = defineStore('app', () => {
     waitingLogin,
     instanceRefreshTick,
     nextRunTime,
+    checkinProgress,
+    checkinTotal,
+    creditsDaily,
     // 计算属性
     enabledAccounts,
     todayCheckedCount,
+    progressDone,
     // 方法
     fetchAccounts,
     importDesktopAccount,
@@ -377,6 +498,14 @@ export const useAppStore = defineStore('app', () => {
     getTraeExePath,
     setTraeExePath,
     scanTraeExePath,
+    addJwtAccount,
+    parseJwtPreview,
+    refreshJwt,
+    clearCooldown,
+    clearAllCooldowns,
+    fetchRemainingCredits,
+    refreshAllCredits,
+    fetchCreditsDaily,
     init
   }
 })

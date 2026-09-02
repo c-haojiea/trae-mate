@@ -413,6 +413,7 @@ mod tests {
             credential_status: None,
             data_dir: Some(dir_str.clone()),
             machine_id: None,
+            ..Default::default()
         };
 
         // 目录凭据更新(expiresAt 更晚)-> 采纳
@@ -488,6 +489,7 @@ mod tests {
             credential_status: None,
             data_dir: Some(tmp_dir.to_string_lossy().to_string()),
             machine_id: None,
+            ..Default::default()
         };
 
         // exe 不存在 -> 启动失败,但 storage.json 应已写入(步骤在启动前)

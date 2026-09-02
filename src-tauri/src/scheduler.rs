@@ -104,7 +104,9 @@ async fn run_auto_checkin(app: AppHandle) {
     let client = app.state::<reqwest::Client>();
     let settings = state.inner().data.lock().unwrap().get_settings();
 
-    let results = perform_all_checkin(client.inner(), state.inner()).await;
+    // 自动签到账号间冷却间隔(分钟),最短 3 分钟
+    let interval_secs = (settings.auto_checkin_interval_min.max(3) as u64) * 60;
+    let results = perform_all_checkin(&app, client.inner(), state.inner(), interval_secs).await;
     let success = results.iter().filter(|(_, r)| r.success).count();
     let failed = results.len() - success;
 

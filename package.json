@@ -1,10 +1,14 @@
 {
   "name": "trae-mate",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Trae Work 签到与多开账号管理 - Tauri2 版",
   "type": "module",
   "author": "traemate",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/luckymiaow/trae-mate.git"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",

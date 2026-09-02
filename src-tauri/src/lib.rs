@@ -2,8 +2,13 @@
 
 mod checkin;
 mod commands;
+mod cooldown;
 mod credentials;
+mod credits;
+mod device_map;
 mod error;
+mod fs_utils;
+mod jwt;
 mod models;
 mod scheduler;
 mod store;
@@ -99,6 +104,8 @@ pub fn run() {
             app.manage(store::AppState {
                 data: std::sync::Mutex::new(data),
                 path,
+                data_dir: app_data,
+                jwt_refresh_lock: tokio::sync::Mutex::new(()),
             });
             app.manage(reqwest::Client::new());
             app.manage(scheduler::SchedulerState::default());
@@ -265,6 +272,17 @@ pub fn run() {
             commands::scan_instance_dirs,
             commands::import_account_from_dir,
             commands::refresh_account_credential,
+            // 参考模式新增
+            commands::account_add_jwt,
+            commands::jwt_parse_preview,
+            commands::refresh_jwt_account,
+            commands::cooldown_clear,
+            commands::cooldown_clear_all,
+            commands::device_reset,
+            commands::fetch_remaining_credits,
+            commands::refresh_all_remaining_credits,
+            commands::credits_daily_list,
+            commands::open_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
