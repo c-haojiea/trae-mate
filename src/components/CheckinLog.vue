@@ -144,18 +144,21 @@ onMounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
   margin-bottom: 16px;
 }
 
-/* 过滤标签栏 - 凹槽容器,激活项凸起 + 强调色文字 */
+/* 过滤标签栏 - 玻璃凹槽容器,激活项浮起 + 强调色文字 */
 .filter-tabs {
   display: flex;
   gap: 4px;
   padding: 5px;
-  background: var(--surface);
-  border: none;
+  background: var(--surface-deep);
+  border: 1px solid var(--glass-border);
   border-radius: var(--r-md);
   box-shadow: var(--shadow-soft-inset);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
 }
 
 .filter-tab {
@@ -179,9 +182,9 @@ onMounted(() => {
 }
 
 .filter-tab.active {
-  background: var(--surface);
+  background: var(--surface-raised);
   color: var(--accent);
-  box-shadow: var(--shadow-soft-raised);
+  box-shadow: var(--shadow-soft-flat);
 }
 
 .filter-tab .count {
@@ -209,6 +212,7 @@ onMounted(() => {
 .toolbar-right {
   display: flex;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .btn-outline.danger {
@@ -232,13 +236,13 @@ onMounted(() => {
   width: 100%;
 }
 
-/* 表头 - 凹陷背景 */
+/* 表头 - 半透明凹槽背景 + 细分隔线 */
 .log-header {
   display: flex;
   padding: 12px 16px;
   background: var(--surface-deep);
   border: none;
-  box-shadow: inset 0 -2px 4px var(--shadow-light);
+  box-shadow: inset 0 -1px 0 var(--glass-border);
   font-size: 12px;
   font-weight: 700;
   color: var(--text-secondary);
@@ -259,11 +263,11 @@ onMounted(() => {
 }
 
 .log-row:not(:last-child) {
-  box-shadow: inset 0 -1px 2px var(--shadow-light);
+  box-shadow: inset 0 -1px 0 rgba(148, 163, 184, 0.14);
 }
 
 .log-row:hover {
-  background: var(--surface-deep);
+  background: var(--surface);
 }
 
 .col-time {
@@ -282,13 +286,12 @@ onMounted(() => {
 .account-tag {
   display: inline-block;
   padding: 2px 9px;
-  background: var(--surface);
+  background: rgba(0, 180, 216, 0.12);
   color: var(--accent);
-  border: none;
+  border: 1px solid rgba(0, 180, 216, 0.20);
   border-radius: var(--r-sm);
   font-size: 12px;
   font-weight: 600;
-  box-shadow: var(--shadow-soft-flat);
 }
 
 .col-result {

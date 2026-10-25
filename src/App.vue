@@ -1,18 +1,29 @@
 <template>
   <div class="app-container">
+    <!-- 背景极光层(纯装饰) -->
+    <div class="aurora" aria-hidden="true">
+      <span class="aurora-blob blob-a"></span>
+      <span class="aurora-blob blob-b"></span>
+      <span class="aurora-blob blob-c"></span>
+    </div>
+
     <div class="app-body">
     <!-- 侧边栏 -->
     <aside class="sidebar">
-      <!-- 品牌面板 - 凸起卡片统一承载窗口控件与 logo,避免顶部松散 -->
-      <div class="window-bar" data-tauri-drag-region>
+      <!-- 窗口操作栏 - 窗口控件左、主题切换右 -->
+      <div class="window-bar" data-tauri-drag-region="deep">
         <div class="window-controls">
-          <button class="win-btn minimize" title="最小化" @click="minimizeWindow"><Icon name="minus" :size="13" /></button>
+          <button class="win-btn" title="最小化" @click="minimizeWindow"><Icon name="minus" :size="13" /></button>
+          <button class="win-btn" :title="isMaximized ? '向下还原' : '最大化'" @click="toggleMaximize">
+            <Icon :name="isMaximized ? 'restore' : 'maximize'" :size="13" />
+          </button>
           <button class="win-btn close" title="关闭" @click="closeWindow"><Icon name="x-mark" :size="13" /></button>
         </div>
         <button class="win-btn theme-toggle" :title="isDark ? '切换到亮色模式' : '切换到暗色模式'" @click="toggleTheme">
           <Icon :name="isDark ? 'sun' : 'moon'" :size="16" />
         </button>
       </div>
+
       <div class="sidebar-header">
         <div class="logo">
           <span class="logo-icon"><Icon name="check" :size="20" /></span>
@@ -24,8 +35,11 @@
       <nav class="nav-menu">
         <div
           class="nav-item"
+          role="button"
+          tabindex="0"
           :class="{ active: activeTab === 'accounts' }"
           @click="activeTab = 'accounts'"
+          @keydown.enter="activeTab = 'accounts'"
         >
           <span class="nav-icon"><Icon name="users" :size="18" /></span>
           <span>账号管理</span>
@@ -33,16 +47,22 @@
         </div>
         <div
           class="nav-item"
+          role="button"
+          tabindex="0"
           :class="{ active: activeTab === 'logs' }"
           @click="activeTab = 'logs'"
+          @keydown.enter="activeTab = 'logs'"
         >
           <span class="nav-icon"><Icon name="clipboard-list" :size="18" /></span>
           <span>签到日志</span>
         </div>
         <div
           class="nav-item"
+          role="button"
+          tabindex="0"
           :class="{ active: activeTab === 'settings' }"
           @click="activeTab = 'settings'"
+          @keydown.enter="activeTab = 'settings'"
         >
           <span class="nav-icon"><Icon name="cog" :size="18" /></span>
           <span>设置</span>
@@ -74,7 +94,7 @@
 
     <main class="main-content">
       <!-- 顶部栏 -->
-      <header class="top-bar" data-tauri-drag-region>
+      <header class="top-bar" data-tauri-drag-region="deep">
         <div class="top-bar-left">
           <h1 class="page-title">{{ currentPageTitle }}</h1>
           <p class="page-subtitle" v-if="activeTab === 'accounts'">管理你的 Trae Work 账号，一键签到</p>
@@ -148,6 +168,8 @@ import SettingsPanel from './components/SettingsPanel.vue'
 import AddAccountModal from './components/AddAccountModal.vue'
 import Icon from './components/Icon.vue'
 
+const appWindow = getCurrentWindow()
+
 const store = useAppStore()
 const activeTab = ref<'accounts' | 'logs' | 'settings'>('accounts')
 const showAddModal = ref(false)
@@ -163,12 +185,35 @@ function showToast(message: string, type: 'success' | 'error' = 'success') {
 }
 
 function closeWindow() {
-  getCurrentWindow().close()
+  appWindow.close()
 }
 
 function minimizeWindow() {
-  getCurrentWindow().minimize()
+  appWindow.minimize()
 }
+
+// 最大化 / 还原(状态与窗口实际状态保持同步,含系统快捷键、双击标题栏触发的变更)
+const isMaximized = ref(false)
+
+async function syncMaximized() {
+  try {
+    isMaximized.value = await appWindow.isMaximized()
+  } catch {
+    /* 忽略:极少数窗口未就绪的情况 */
+  }
+}
+
+async function toggleMaximize() {
+  try {
+    await appWindow.toggleMaximize()
+    await syncMaximized()
+  } catch (e) {
+    console.error('切换最大化失败:', e)
+  }
+}
+
+// 双击拖拽区最大化/还原由 Tauri 原生 drag-region 处理(data-tauri-drag-region),
+// 不要再绑 @dblclick,否则会与原生 toggle 叠加成"最大化后立即还原"。
 
 // 明暗主题切换(localStorage 持久化,main.ts 已完成初始设置)
 const isDark = ref(document.documentElement.dataset.theme === 'dark')
@@ -219,6 +264,8 @@ async function handleRefresh() {
 
 onMounted(() => {
   store.init()
+  void syncMaximized()
+  void appWindow.onResized(() => { void syncMaximized() })
   // 监听系统托盘"一键签到"菜单
   listen('tray-checkin', () => {
     handleCheckinAll()
@@ -245,7 +292,65 @@ onMounted(() => {
   width: 100%;
   height: 100vh;
   overflow: hidden;
-  background: var(--surface);
+  background: transparent;
+}
+
+/* 背景极光 - 极缓慢漂移,低饱和度,仅为玻璃提供层次 */
+.aurora {
+  position: fixed;
+  inset: -12%;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.aurora-blob {
+  position: absolute;
+  border-radius: 50%;
+  opacity: 0.85;
+  will-change: transform;
+}
+
+.blob-a {
+  width: 52vw;
+  height: 52vw;
+  left: -10vw;
+  top: -18vw;
+  background: radial-gradient(closest-side, var(--aurora-1), transparent 72%);
+  animation: drift-a 34s ease-in-out infinite alternate;
+}
+
+.blob-b {
+  width: 46vw;
+  height: 46vw;
+  right: -8vw;
+  top: -6vw;
+  background: radial-gradient(closest-side, var(--aurora-2), transparent 72%);
+  animation: drift-b 42s ease-in-out infinite alternate;
+}
+
+.blob-c {
+  width: 60vw;
+  height: 40vw;
+  left: 24vw;
+  bottom: -24vw;
+  background: radial-gradient(closest-side, var(--aurora-3), transparent 70%);
+  animation: drift-c 50s ease-in-out infinite alternate;
+}
+
+@keyframes drift-a {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to { transform: translate3d(4vw, 3vw, 0) scale(1.08); }
+}
+
+@keyframes drift-b {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to { transform: translate3d(-5vw, 4vw, 0) scale(0.95); }
+}
+
+@keyframes drift-c {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to { transform: translate3d(-4vw, -3vw, 0) scale(1.06); }
 }
 
 .app-body {
@@ -257,88 +362,100 @@ onMounted(() => {
 }
 
 .login-waiting-banner {
-  padding: 10px 24px;
-  background: var(--accent);
-  color: #fff;
+  margin: 0 0 12px;
+  padding: 10px 16px;
+  background: var(--accent-light);
+  border: 1px solid rgba(0, 180, 216, 0.24);
+  border-radius: var(--r-sm);
+  color: var(--accent);
   font-size: 13px;
   font-weight: 600;
   text-align: center;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
 }
 
-/* 窗口操作栏 - 窗口控件左、主题切换右,两端对齐(独立于 logo 区,不共卡片) */
+/* ===== 侧边栏 ===== */
+.sidebar {
+  position: relative;
+  z-index: 1;
+  width: 246px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  margin: 10px 0 10px 10px;
+  border-radius: var(--r-xl);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-md-raised);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  overflow: hidden;
+}
+
+/* 窗口操作栏 */
 .window-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 18px 6px;
+  padding: 12px 14px 4px;
 }
 
-/* 窗口控件 - 橙色细线边框(参考小米台灯线条设计感),内嵌凸起圆钮 */
 .window-controls {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 5px;
-  width: fit-content;
+  gap: 2px;
+  padding: 3px;
   background: var(--surface);
-  border: 2px solid #e60012;
-  border-radius: var(--r-pill);
-  box-shadow: none;
+  border: 1px solid var(--glass-border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-soft-flat);
 }
 
 .win-btn {
-  width: 24px;
+  width: 26px;
   height: 24px;
   border: none;
-  border-radius: 50%;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary);
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--surface);
-  color: var(--text-muted);
-  box-shadow: var(--shadow-soft-raised);
-  transition: box-shadow var(--t-press), transform var(--t-press), color var(--t-smooth);
+  transition: background var(--t-smooth), color var(--t-smooth), transform var(--t-press);
 }
 
 .win-btn:hover {
+  background: rgba(148, 163, 184, 0.20);
   color: var(--text-primary);
-  box-shadow: var(--shadow-md-raised);
 }
 
 .win-btn:active {
-  box-shadow: var(--shadow-soft-inset);
   transform: scale(0.92);
 }
 
 .win-btn.close:hover {
-  color: var(--danger);
+  background: #ef4444;
+  color: #fff;
 }
 
-/* 主题切换钮 - 略大于窗口控件,强调功能 */
+/* 主题切换钮 */
 .theme-toggle {
   width: 30px;
   height: 30px;
+  border-radius: 9px;
+  background: var(--surface);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-soft-flat);
 }
 
-/* 侧边栏 - 同一表面,右侧柔和凹槽分隔 */
-.sidebar {
-  position: relative;
-  z-index: 1;
-  width: 250px;
-  display: flex;
-  flex-direction: column;
-  background: var(--surface);
-  box-shadow: none;
+.theme-toggle:hover {
+  background: var(--surface-raised);
 }
 
 .sidebar-header {
-  margin: 12px 14px 16px;
-  padding: 18px;
-  background: var(--surface);
-  border: none;
-  border-radius: var(--r-lg);
-  box-shadow: var(--shadow-soft-raised);
+  padding: 6px 18px 18px;
 }
 
 .logo {
@@ -349,65 +466,88 @@ onMounted(() => {
 }
 
 .logo-icon {
-  width: 36px;
-  height: 36px;
-  background: var(--accent);
+  width: 38px;
+  height: 38px;
+  background: var(--accent-grad);
   border-radius: 12px;
   display: flex;
   align-items: center;
   justify-content: center;
   font-weight: 700;
-  font-size: 20px;
   color: #fff;
-  box-shadow: var(--shadow-soft-flat), var(--accent-glow);
+  box-shadow: 0 6px 16px rgba(0, 180, 216, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.35);
 }
 
 .logo-text {
   font-family: 'Nunito', 'Inter', sans-serif;
-  font-size: 19px;
+  font-size: 20px;
   font-weight: 800;
   letter-spacing: 0.2px;
-  color: var(--text-primary);
+  background: var(--accent-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
 }
 
 .logo-desc {
   font-size: 12px;
-  color: var(--text-secondary);
-  margin-left: 48px;
+  color: var(--text-muted);
+  margin-left: 50px;
 }
 
 .nav-menu {
   flex: 1;
-  padding: 14px 12px;
+  overflow-y: auto;
+  padding: 4px 12px;
 }
 
 .nav-item {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 11px;
   padding: 11px 14px;
   border-radius: 12px;
   cursor: pointer;
-  transition: all var(--t-smooth);
+  transition: background var(--t-smooth), color var(--t-smooth), box-shadow var(--t-smooth), transform var(--t-press);
   color: var(--text-secondary);
   font-size: 14px;
   font-weight: 600;
   margin-bottom: 6px;
   background: transparent;
-  box-shadow: none;
+  outline: none;
 }
 
 .nav-item:hover {
   color: var(--text-primary);
   background: var(--surface);
-  box-shadow: var(--shadow-soft-flat);
+}
+
+.nav-item:active {
+  transform: scale(0.985);
+}
+
+.nav-item:focus-visible {
+  box-shadow: 0 0 0 2px var(--accent-light);
 }
 
 .nav-item.active {
   color: var(--accent);
-  background: var(--surface);
-  box-shadow: var(--shadow-soft-inset);
+  background: var(--surface-raised);
   font-weight: 700;
+  box-shadow: var(--shadow-soft-flat);
+}
+
+.nav-item.active::before {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 50%;
+  width: 3px;
+  height: 18px;
+  border-radius: var(--r-pill);
+  background: var(--accent-grad);
+  transform: translateY(-50%);
 }
 
 .nav-icon {
@@ -417,25 +557,25 @@ onMounted(() => {
 
 .nav-badge {
   margin-left: auto;
-  background: var(--accent);
+  background: var(--accent-grad);
   color: #fff;
   font-size: 11px;
-  padding: 2px 9px;
+  padding: 2px 8px;
   border-radius: var(--r-pill);
   font-weight: 700;
-  box-shadow: var(--accent-glow);
+  box-shadow: 0 3px 10px rgba(0, 180, 216, 0.35);
 }
 
 .sidebar-footer {
-  padding: 16px;
+  padding: 12px;
 }
 
 .status-card {
   background: var(--surface);
-  border: none;
+  border: 1px solid var(--glass-border);
   border-radius: var(--r-md);
   padding: 14px;
-  box-shadow: var(--shadow-soft-raised);
+  box-shadow: var(--shadow-soft-inset);
 }
 
 .status-item {
@@ -471,13 +611,15 @@ onMounted(() => {
   color: var(--success);
 }
 
-/* 主内容区 */
+/* ===== 主内容区 ===== */
 .main-content {
   position: relative;
   z-index: 1;
   flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
+  padding: 10px;
   overflow: hidden;
 }
 
@@ -485,19 +627,27 @@ onMounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 18px 24px;
-  margin: 14px 16px 0;
-  background: var(--surface);
-  border: none;
+  gap: 16px;
+  padding: 16px 20px;
+  margin-bottom: 12px;
+  flex-shrink: 0;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
   border-radius: var(--r-lg);
   box-shadow: var(--shadow-soft-raised);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+}
+
+.top-bar-left {
+  min-width: 0;
 }
 
 .page-title {
   font-size: 21px;
   font-weight: 800;
   color: var(--text-primary);
-  margin-bottom: 4px;
+  margin-bottom: 3px;
   letter-spacing: -0.01em;
 }
 
@@ -509,40 +659,69 @@ onMounted(() => {
 .top-bar-right {
   display: flex;
   gap: 10px;
+  flex-shrink: 0;
 }
 
 .content-area {
   flex: 1;
   overflow-y: auto;
-  padding: 22px;
-  margin: 14px 16px 16px;
-  background: var(--surface);
+  padding: 2px 2px 6px;
+  background: transparent;
   border: none;
-  border-radius: var(--r-lg);
-  box-shadow: var(--shadow-soft-inset);
+  box-shadow: none;
 }
 
-/* 顶部通知 - 彩色填充(信息通知,非装饰) */
+/* 顶部通知 - 玻璃药丸 + 状态色 */
 .top-toast {
   position: fixed;
   top: 20px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 2000;
-  padding: 12px 22px;
-  border-radius: var(--r-md);
-  color: #fff;
-  border: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 20px;
+  border-radius: var(--r-pill);
+  background: var(--glass-bg-strong);
+  border: 1px solid var(--glass-border);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
   font-weight: 600;
+  font-size: 13px;
   box-shadow: var(--shadow-md-raised);
+  animation: toast-in 0.26s var(--t-lift);
+}
+
+.top-toast::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
 }
 
 .top-toast.success {
+  color: var(--success);
+}
+
+.top-toast.success::before {
   background: var(--success);
+  box-shadow: 0 0 8px var(--success);
 }
 
 .top-toast.error {
+  color: var(--danger);
+}
+
+.top-toast.error::before {
   background: var(--danger);
+  box-shadow: 0 0 8px var(--danger);
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translate(-50%, -10px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
 }
 
 /* 刷新按钮图标旋转动画(:deep 穿透到 Icon 根 svg) */

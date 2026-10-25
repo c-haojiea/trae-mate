@@ -346,10 +346,10 @@ function expireText(ms: number): string {
   z-index: 1000;
 }
 
-/* 弹窗 - 强凸起卡片 */
+/* 弹窗 - 强浮起玻璃卡片 */
 .modal-content {
-  background: var(--surface);
-  border: none;
+  background: var(--glass-bg-strong);
+  border: 1px solid var(--glass-border);
   border-radius: var(--r-xl);
   width: 520px;
   max-width: 90vw;
@@ -357,6 +357,9 @@ function expireText(ms: number): string {
   display: flex;
   flex-direction: column;
   box-shadow: var(--shadow-bold-raised);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  overflow: hidden;
 }
 
 .modal-header {
@@ -364,7 +367,7 @@ function expireText(ms: number): string {
   justify-content: space-between;
   align-items: center;
   padding: 20px 24px;
-  box-shadow: inset 0 -2px 5px var(--shadow-light);
+  box-shadow: inset 0 -1px 0 var(--glass-border);
 }
 
 .modal-header h2 {

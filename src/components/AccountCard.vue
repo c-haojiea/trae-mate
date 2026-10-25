@@ -124,7 +124,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useAppStore, type Account, type InstanceState } from '../stores/app'
 
 const props = defineProps<{
@@ -144,7 +144,27 @@ const isJwt = computed(() => props.account.source === 'jwt')
 
 onMounted(async () => {
   instanceState.value = await store.getInstanceState(props.account.id)
+  startInstancePoll()
 })
+
+// 定期轮询实例状态:用户可能在本应用之外关闭 TRAE 窗口,需及时把「聚焦」还原成「启动」
+let pollTimer: number | undefined
+function startInstancePoll() {
+  stopInstancePoll()
+  pollTimer = window.setInterval(async () => {
+    if (instanceState.value.source === 'none') return // 未运行时不轮询,避免无谓开销
+    const s = await store.getInstanceState(props.account.id)
+    instanceState.value = s
+    if (s.source === 'none') stopInstancePoll()
+  }, 5000)
+}
+function stopInstancePoll() {
+  if (pollTimer !== undefined) {
+    window.clearInterval(pollTimer)
+    pollTimer = undefined
+  }
+}
+onUnmounted(stopInstancePoll)
 
 // 监听全局刷新信号(顶部"刷新"按钮触发),重新查询本账号实例运行状态(含主/工具来源)
 watch(() => store.instanceRefreshTick, async () => {
@@ -250,6 +270,7 @@ async function handleLaunchMulti() {
   try {
     await store.launchMulti(props.account.id)
     instanceState.value = { running: true, source: 'tool', isMainAccount: instanceState.value.isMainAccount }
+    startInstancePoll()
     emit('notify', '实例已启动', 'success')
   } catch (e: any) {
     emit('notify', '启动失败: ' + (e?.message || e), 'error')
@@ -264,7 +285,15 @@ async function handleFocus() {
   try {
     await store.focusInstance(props.account.id)
   } catch (e: any) {
-    emit('notify', '聚焦失败: ' + (e?.message || e), 'error')
+    // 实例可能已被用户在外部关闭:回查状态,让按钮自动还原为「启动」
+    const s = await store.getInstanceState(props.account.id)
+    instanceState.value = s
+    if (s.source === 'none') {
+      stopInstancePoll()
+      emit('notify', '该账号实例已关闭,按钮已还原为「启动」', 'success')
+    } else {
+      emit('notify', '聚焦失败: ' + (e?.message || e), 'error')
+    }
   }
 }
 
@@ -335,18 +364,21 @@ function formatDateTime(timestamp: number): string {
 </script>
 
 <style scoped>
-/* 账号卡片 - 凸起,hover 上浮 */
+/* 账号卡片 - 玻璃,hover 上浮 */
 .account-card {
   padding: 20px;
-  transition: box-shadow var(--t-smooth), transform var(--t-smooth);
-  background: var(--surface);
-  border: none;
+  transition: box-shadow var(--t-smooth), transform var(--t-smooth), border-color var(--t-smooth);
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
   border-radius: var(--r-lg);
   box-shadow: var(--shadow-soft-raised);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
 }
 
 .account-card:hover {
   box-shadow: var(--shadow-md-raised);
+  border-color: var(--glass-border-strong);
   transform: translateY(-3px);
 }
 
@@ -369,12 +401,12 @@ function formatDateTime(timestamp: number): string {
   min-width: 0;
 }
 
-/* 头像 - 强调色填充 + 白字(品牌标识,小面积) */
+/* 头像 - 渐变强调色 + 白字(品牌标识,小面积) */
 .avatar {
   width: 44px;
   height: 44px;
   border-radius: 14px;
-  background: var(--accent);
+  background: var(--accent-grad);
   color: #fff;
   display: flex;
   align-items: center;
@@ -382,7 +414,7 @@ function formatDateTime(timestamp: number): string {
   font-size: 18px;
   font-weight: 700;
   font-family: 'Nunito', 'Inter', sans-serif;
-  box-shadow: var(--shadow-soft-flat), var(--accent-glow);
+  box-shadow: 0 6px 16px rgba(0, 180, 216, 0.30), inset 0 1px 0 rgba(255, 255, 255, 0.35);
   flex-shrink: 0;
 }
 
@@ -409,10 +441,10 @@ function formatDateTime(timestamp: number): string {
   font-size: 11px;
   font-weight: 600;
   color: #fff;
-  background: var(--accent);
+  background: var(--accent-grad);
   border-radius: 6px;
   vertical-align: middle;
-  box-shadow: var(--accent-glow);
+  box-shadow: 0 2px 8px rgba(0, 180, 216, 0.28);
 }
 
 .badge {
@@ -551,9 +583,11 @@ function formatDateTime(timestamp: number): string {
   width: 360px;
   padding: 22px;
   border-radius: var(--r-lg);
-  background: var(--surface);
-  border: none;
+  background: var(--glass-bg-strong);
+  border: 1px solid var(--glass-border);
   box-shadow: var(--shadow-bold-raised);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
 }
 
 .edit-dialog h3 {

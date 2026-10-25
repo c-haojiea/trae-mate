@@ -107,25 +107,28 @@ function handleEdit(id: string, newName?: string) {
   margin-bottom: 24px;
 }
 
-/* 统计卡片 - 凸起,hover 上浮 */
+/* 统计卡片 - 玻璃,hover 上浮 */
 .stat-card {
-  background: var(--surface);
-  border: none;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
   border-radius: var(--r-md);
   padding: 18px;
   display: flex;
   align-items: center;
   gap: 14px;
   box-shadow: var(--shadow-soft-raised);
-  transition: box-shadow var(--t-smooth), transform var(--t-smooth);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  transition: box-shadow var(--t-smooth), transform var(--t-smooth), border-color var(--t-smooth);
 }
 
 .stat-card:hover {
   transform: translateY(-3px);
+  border-color: var(--glass-border-strong);
   box-shadow: var(--shadow-md-raised);
 }
 
-/* 统计图标 - 凸起小方块,图标用状态色(小面积着色) */
+/* 统计图标 - 状态色淡染小方块 */
 .stat-icon {
   width: 48px;
   height: 48px;
@@ -134,24 +137,29 @@ function handleEdit(id: string, newName?: string) {
   align-items: center;
   justify-content: center;
   background: var(--surface);
-  box-shadow: var(--shadow-soft-raised);
+  border: 1px solid var(--glass-border);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
   flex-shrink: 0;
 }
 
 .stat-icon.total {
   color: var(--accent);
+  background: rgba(0, 180, 216, 0.14);
 }
 
 .stat-icon.enabled {
   color: var(--success);
+  background: rgba(5, 150, 105, 0.12);
 }
 
 .stat-icon.success {
   color: var(--warning);
+  background: rgba(217, 119, 6, 0.12);
 }
 
 .stat-icon.points {
-  color: var(--danger);
+  color: var(--accent-2);
+  background: rgba(124, 92, 255, 0.14);
 }
 
 .stat-info {

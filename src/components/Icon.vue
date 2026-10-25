@@ -28,6 +28,13 @@
     </g>
     <!-- ─ 最小化 -->
     <path v-else-if="name === 'minus'" d="M19.5 12h-15" />
+    <!-- ☐ 最大化 -->
+    <path v-else-if="name === 'maximize'" d="M4.5 4.5h15v15h-15z" />
+    <!-- ⧉ 还原(退出最大化) -->
+    <g v-else-if="name === 'restore'">
+      <path d="M8.5 8.5h11v11h-11z" />
+      <path d="M15.5 8.5v-3a1 1 0 00-1-1h-10a1 1 0 00-1 1v10a1 1 0 001 1h3" />
+    </g>
     <!-- ✕ 关闭 -->
     <path v-else-if="name === 'x-mark'" d="M6 18L18 6M6 6l12 12" />
     <!-- ＋ 添加 -->

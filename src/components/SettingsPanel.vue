@@ -566,14 +566,16 @@ function formatJson(obj?: Record<string, any>): string {
   box-shadow: var(--shadow-soft-raised);
 }
 
-/* 设置分区卡片 - 凸起 */
+/* 设置分区卡片 - 玻璃 */
 .settings-section {
   padding: 24px;
   margin-bottom: 20px;
-  background: var(--surface);
-  border: none;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
   border-radius: var(--r-lg);
   box-shadow: var(--shadow-soft-raised);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
 }
 
 .section-title {
