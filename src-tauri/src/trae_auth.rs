@@ -1,7 +1,7 @@
 // 读取并解密 TRAE 桌面客户端凭据。忠实移植自 electron/trae-auth.cjs。
 //
 // 算法:
-// 1. 读取 %APPDATA%/TRAE SOLO CN/User/globalStorage/storage.json
+// 1. 读取 %APPDATA%\<TRAE 数据目录>(当前为 Trae CN)/User/globalStorage/storage.json
 // 2. 取 iCubeAuthInfo://icube.cloudide(base64 信封)
 // 3. 信封 = HEADER(6) + randomKey(32) + 密文
 //    secret = LEFT_SECRET ⊕ RIGHT_SECRET(64)
@@ -9,9 +9,8 @@
 //    AES-128-CBC 解密: key=derived[0..16], iv=derived[16..32]
 //    明文 = digest(64) + payload(JSON);校验 digest == SHA512(payload)
 
-use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use base64::{engine::general_purpose, Engine as _};
@@ -159,11 +158,9 @@ pub fn encrypt_trae_auth_info(plaintext: &str) -> AppResult<String> {
     Ok(general_purpose::STANDARD.encode(&output))
 }
 
-/// 读取并解密当前 TRAE 桌面客户端凭据(主目录 %APPDATA%\TRAE SOLO CN)
+/// 读取并解密当前 TRAE 桌面客户端凭据(主目录,按候选名探测)
 pub fn get_trae_desktop_credentials() -> AppResult<Credential> {
-    let appdata = env::var("APPDATA")
-        .map_err(|_| AppError::Credential("Windows APPDATA directory is unavailable".into()))?;
-    let data_dir = PathBuf::from(&appdata).join("TRAE SOLO CN");
+    let data_dir = crate::trae_machine::resolve_main_data_dir()?;
     read_credentials_from_data_dir(&data_dir)
 }
 
@@ -173,7 +170,16 @@ pub fn read_credentials_from_data_dir(data_dir: &Path) -> AppResult<Credential> 
         .join("User")
         .join("globalStorage")
         .join("storage.json");
-    let raw = std::fs::read_to_string(&storage_path)?;
+    let raw = match std::fs::read_to_string(&storage_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AppError::Credential(format!(
+                "TRAE 登录数据文件不存在: {}（请先启动 TRAE 并完成登录）",
+                storage_path.display()
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
     let storage: Value = serde_json::from_str(&raw)?;
 
     let encrypted = storage
@@ -377,9 +383,8 @@ pub fn read_auth_from_data_dir_loose(
 /// 读取主目录实例的 telemetry.devDeviceId(用于识别工具目录是否被污染为与主目录共用设备)。
 /// 设备 id 非敏感,仅做对照。失败返回 None。
 pub fn read_main_telemetry_device_id() -> Option<String> {
-    let appdata = env::var("APPDATA").ok()?;
-    let storage_path = PathBuf::from(&appdata)
-        .join("TRAE SOLO CN")
+    let data_dir = crate::trae_machine::resolve_main_data_dir().ok()?;
+    let storage_path = data_dir
         .join("User")
         .join("globalStorage")
         .join("storage.json");
@@ -392,12 +397,11 @@ pub fn read_main_telemetry_device_id() -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// 读取主目录实例当前登录的 userId(读 %APPDATA%\TRAE SOLO CN\...\storage.json 解密 iCubeAuthInfo)。
+/// 读取主目录实例当前登录的 userId(读主目录 storage.json 解密 iCubeAuthInfo)。
 /// 仅用于判断主实例登录账号:失败返回 None(主实例未登录/异常时不阻断状态判定)。
 pub fn read_main_instance_user_id() -> Option<String> {
-    let appdata = env::var("APPDATA").ok()?;
-    let storage_path = PathBuf::from(&appdata)
-        .join("TRAE SOLO CN")
+    let data_dir = crate::trae_machine::resolve_main_data_dir().ok()?;
+    let storage_path = data_dir
         .join("User")
         .join("globalStorage")
         .join("storage.json");
@@ -471,15 +475,14 @@ mod tests {
     /// 诊断:打印真实 dc 签名密钥的 PEM 标签(仅标签行,不含密钥材料),确认密钥类型
     #[test]
     fn print_signing_key_pem_labels() {
-        let appdata = match env::var("APPDATA") {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!("[trae_auth] 非 Windows 环境,跳过");
+        let data_dir = match crate::trae_machine::resolve_main_data_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[trae_auth] 未找到 TRAE 主数据目录,跳过: {e}");
                 return;
             }
         };
-        let storage_path = PathBuf::from(&appdata)
-            .join("TRAE SOLO CN")
+        let storage_path = data_dir
             .join("User")
             .join("globalStorage")
             .join("storage.json");
@@ -515,15 +518,15 @@ mod tests {
     /// 用本机真实 storage.json 验证解密链路。不输出任何敏感值,
     /// 仅断言能解出非空 token/userId/host(说明算法正确)。
     #[test]
-    fn decrypt_real_trae_storage() {        let appdata = match env::var("APPDATA") {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!("[trae_auth] 非 Windows 环境,跳过");
+    fn decrypt_real_trae_storage() {
+        let data_dir = match crate::trae_machine::resolve_main_data_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[trae_auth] 未找到 TRAE 主数据目录,跳过: {e}");
                 return;
             }
         };
-        let path = PathBuf::from(&appdata)
-            .join("TRAE SOLO CN")
+        let path = data_dir
             .join("User")
             .join("globalStorage")
             .join("storage.json");

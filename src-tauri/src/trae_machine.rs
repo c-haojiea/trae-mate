@@ -12,10 +12,12 @@ use crate::error::{AppError, AppResult};
 use crate::models::Account;
 use crate::trae_auth;
 
-/// TRAE SOLO CN 进程名
-pub const PROCESS_NAME: &str = "TRAE SOLO CN.exe";
-/// TRAE SOLO CN 数据目录名(默认实例)
+/// TRAE exe 文件名候选(客户端改名后旧名仍保留,优先新名)
+pub const EXE_NAMES: &[&str] = &["Trae CN.exe", "TRAE SOLO CN.exe"];
+/// 多开/登录临时实例目录前缀(历史目录沿用该前缀,禁止改动,否则旧实例扫描与复用全部失效)
 pub const DATA_DIR_NAME: &str = "TRAE SOLO CN";
+/// TRAE 主数据目录名候选(客户端改名后主目录名会变,按存在性探测)
+pub const MAIN_DATA_DIR_CANDIDATES: &[&str] = &["Trae CN", "TRAE SOLO CN", "Trae Work CN"];
 /// exe 路径配置文件名(放在应用 config 目录下)
 const EXE_PATH_FILE: &str = "trae_exe_path.txt";
 
@@ -101,24 +103,32 @@ pub fn resolve_trae_path(config_dir: &Path) -> AppResult<String> {
 pub fn scan_trae_exe_path() -> AppResult<String> {
     let appdata_local = std::env::var("LOCALAPPDATA")
         .map_err(|_| AppError::Launch("无法获取 LOCALAPPDATA 环境变量".into()))?;
-    let candidates = [
-        PathBuf::from(&appdata_local).join("Programs").join(DATA_DIR_NAME).join(PROCESS_NAME),
-        PathBuf::from(&appdata_local).join("Programs").join("Trae").join(PROCESS_NAME),
-        PathBuf::from(&appdata_local).join(DATA_DIR_NAME).join(PROCESS_NAME),
-        PathBuf::from(r"C:\Program Files\TRAE SOLO CN\TRAE SOLO CN.exe"),
-        PathBuf::from(r"D:\TRAE SOLO CN\TRAE SOLO CN.exe"),
-        PathBuf::from(r"E:\TRAE SOLO CN\TRAE SOLO CN.exe"),
+    let dirs = [
+        PathBuf::from(&appdata_local).join("Programs").join("Trae CN"),
+        PathBuf::from(&appdata_local).join("Programs").join("TRAE SOLO CN"),
+        PathBuf::from(&appdata_local).join("Programs").join("Trae"),
+        PathBuf::from(&appdata_local).join("Trae CN"),
+        PathBuf::from(&appdata_local).join("TRAE SOLO CN"),
+        PathBuf::from(r"C:\Program Files\Trae CN"),
+        PathBuf::from(r"C:\Program Files\TRAE SOLO CN"),
+        PathBuf::from(r"D:\Trae CN"),
+        PathBuf::from(r"D:\TRAE SOLO CN"),
+        PathBuf::from(r"E:\Trae CN"),
+        PathBuf::from(r"E:\TRAE SOLO CN"),
     ];
-    for c in &candidates {
-        if c.exists() {
-            return Ok(c.to_string_lossy().to_string());
+    for dir in &dirs {
+        for name in EXE_NAMES {
+            let c = dir.join(name);
+            if c.exists() {
+                return Ok(c.to_string_lossy().to_string());
+            }
         }
     }
     if let Ok(p) = scan_from_registry() {
         return Ok(p);
     }
     Err(AppError::Launch(
-        "未找到 TRAE Work CN 安装路径,请在设置中手动选择 TRAE SOLO CN.exe".into(),
+        "未找到 TRAE Work CN 安装路径,请在设置中手动选择 Trae CN.exe".into(),
     ))
 }
 
@@ -140,7 +150,7 @@ fn scan_from_registry() -> AppResult<String> {
         r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
     ];
     const EXCLUDE: &[&str] = &["manager", "trae auto"];
-    const MATCH: &[&str] = &["TRAE SOLO CN", "TRAE Work CN"];
+    const MATCH: &[&str] = &["Trae CN", "TRAE SOLO CN", "TRAE Work CN"];
 
     for root in [hklm, hkcu] {
         for up in &uninstall_paths {
@@ -195,9 +205,11 @@ fn scan_from_registry() -> AppResult<String> {
                     }
                 }
                 for dir in &dirs {
-                    let exe = PathBuf::from(dir).join(PROCESS_NAME);
-                    if exe.exists() {
-                        return Ok(exe.to_string_lossy().to_string());
+                    for name in EXE_NAMES {
+                        let exe = PathBuf::from(dir).join(name);
+                        if exe.exists() {
+                            return Ok(exe.to_string_lossy().to_string());
+                        }
                     }
                 }
                 if !display_icon.is_empty() {
@@ -210,7 +222,8 @@ fn scan_from_registry() -> AppResult<String> {
                         .to_string();
                     let p = PathBuf::from(&icon);
                     if p.exists() && p.extension().and_then(|e| e.to_str()) == Some("exe") {
-                        if p.file_name().and_then(|n| n.to_str()) == Some(PROCESS_NAME) {
+                        let file_name = p.file_name().and_then(|n| n.to_str());
+                        if EXE_NAMES.iter().any(|n| file_name == Some(*n)) {
                             return Ok(icon);
                         }
                     }
@@ -294,11 +307,41 @@ pub fn is_instance_running(data_dir: &str) -> (bool, Option<u32>) {
 
 // ===== 主实例(默认 data-dir)检测 =====
 
-/// 主实例 data-dir(%APPDATA%\TRAE SOLO CN,即用户手动启动 TRAE 用的默认目录)
-pub fn main_data_dir() -> AppResult<PathBuf> {
+/// 解析 TRAE 主数据目录(%APPDATA%\<候选名>)。主目录名随客户端改名而变,按存在性探测,
+/// 优先返回含 storage.json 的候选;仅存在但未登录的候选作为次选。
+pub fn resolve_main_data_dir() -> AppResult<PathBuf> {
     let appdata = std::env::var("APPDATA")
         .map_err(|_| AppError::Launch("无法获取 APPDATA 环境变量".into()))?;
-    Ok(PathBuf::from(&appdata).join(DATA_DIR_NAME))
+    let base = PathBuf::from(&appdata);
+    let mut first_existing: Option<PathBuf> = None;
+    for name in MAIN_DATA_DIR_CANDIDATES {
+        let dir = base.join(name);
+        if !dir.is_dir() {
+            continue;
+        }
+        if dir.join("User").join("globalStorage").join("storage.json").exists() {
+            return Ok(dir);
+        }
+        if first_existing.is_none() {
+            first_existing = Some(dir);
+        }
+    }
+    if let Some(dir) = first_existing {
+        return Ok(dir);
+    }
+    let tried = MAIN_DATA_DIR_CANDIDATES
+        .iter()
+        .map(|n| format!("%APPDATA%\\{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(AppError::Credential(format!(
+        "未找到 TRAE 主数据目录，已尝试: {tried}。请先启动 TRAE 并登录后重试。"
+    )))
+}
+
+/// 主实例 data-dir(用户手动启动 TRAE 用的默认目录,当前为 %APPDATA%\Trae CN)
+pub fn main_data_dir() -> AppResult<PathBuf> {
+    resolve_main_data_dir()
 }
 
 /// 账号实例运行来源

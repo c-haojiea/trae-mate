@@ -596,7 +596,7 @@ pub fn launch_account_by_id(app: &AppHandle, account_id: &str) -> AppResult<Laun
     if is_main_account {
         let appdata = std::env::var("APPDATA")
             .map_err(|_| AppError::Launch("无法获取 APPDATA 环境变量".into()))?;
-        let main_dir = PathBuf::from(&appdata).join(trae_machine::DATA_DIR_NAME);
+        let main_dir = trae_machine::main_data_dir()?;
         let shared_ext = PathBuf::from(&appdata)
             .join(trae_instance::SHARED_EXTENSIONS_DIR)
             .to_string_lossy()
