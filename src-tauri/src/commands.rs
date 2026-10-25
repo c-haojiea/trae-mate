@@ -249,7 +249,8 @@ pub async fn checkin_all(
     app: AppHandle,
 ) -> AppResult<Vec<(PublicAccount, CheckinResult)>> {
     // 手动一键签到:账号间保持 2s 快速执行(自动定时签到用可配置的分钟级间隔,见 scheduler)
-    Ok(checkin::perform_all_checkin(&app, client.inner(), state.inner(), 2).await)
+    // 手动不跳过当天已签账号,保证用户主动点击时能看到每个账号的真实状态
+    Ok(checkin::perform_all_checkin(&app, client.inner(), state.inner(), 2, false).await)
 }
 
 #[tauri::command]
@@ -623,14 +624,27 @@ pub fn launch_account_by_id(app: &AppHandle, account_id: &str) -> AppResult<Laun
     // 回读到更新凭据时同步应用存储,下次签到直接用新值
     if adopted {
         let encrypted_new = credentials::encrypt_credential(&cred)?;
+        // 同步凭证状态:仅回写 token 不更新 credentialStatus 会让卡片在重新登录后
+        // 仍显示"凭证已失效"(旧状态残留到下次签到/手动刷新)
+        let status = credential_status(cred.expires_at, now_ms());
         let mut data = state.data.lock().unwrap();
         let _ = data.update_account(
             account_id,
-            serde_json::json!({ "encryptedCredential": encrypted_new }),
+            serde_json::json!({ "encryptedCredential": encrypted_new, "credentialStatus": status }),
         );
         let _ = data.save(&state.path);
     }
-    let result = trae_instance::launch_multi(&account, &cred, &exe_path)?;
+    // 其他账号已占用的机器码:避免本实例复用同一设备身份(多账号共用设备会触发 4017 设备绑定上限)
+    let taken_machine_ids: Vec<String> = {
+        let data = state.data.lock().unwrap();
+        data.get_accounts()
+            .iter()
+            .filter(|a| a.id != account_id)
+            .filter_map(|a| a.machine_id.clone())
+            .filter(|m| !m.is_empty())
+            .collect()
+    };
+    let result = trae_instance::launch_multi(&account, &cred, &exe_path, &taken_machine_ids)?;
 
     // 5. 回写 data_dir/machine_id(首次启动时绑定,后续复用同一目录与机器码)
     {

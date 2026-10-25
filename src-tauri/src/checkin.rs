@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::cooldown;
 use crate::credentials::{decrypt_credential, decrypt_jwt_secret, encrypt_credential, encrypt_jwt_secret};
@@ -21,6 +21,25 @@ const DEFAULT_HOST: &str = "https://api.trae.cn";
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// 时间戳是否落在今天(Asia/Shanghai,与签到调度时区一致)
+pub fn checked_in_today(ms: i64) -> bool {
+    let Some(dt) = chrono::DateTime::from_timestamp_millis(ms) else {
+        return false;
+    };
+    let tz = chrono_tz::Asia::Shanghai;
+    dt.with_timezone(&tz).date_naive() == chrono::Utc::now().with_timezone(&tz).date_naive()
+}
+
+/// 是否还有当天未签到的启用账号(补签判断用)
+pub fn has_unchecked_today(app: &AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    let data = state.inner().data.lock().unwrap();
+    data.get_accounts()
+        .iter()
+        .filter(|a| a.enabled)
+        .any(|a| a.last_checkin_at.map(|ms| !checked_in_today(ms)).unwrap_or(true))
 }
 
 fn api_succeeded(data: &Value) -> bool {
@@ -554,11 +573,13 @@ pub async fn perform_checkin(
 
 /// 执行所有启用账号签到:过滤冷却/已过期 → 积分过期感知排序 → 逐账号引擎 → 写 checkin_summary。
 /// `account_interval_secs`:账号之间的执行间隔(手动一键签到传 2s;自动定时签到传配置的分钟数×60)。
+/// `skip_checked_today`:自动补签时为 true,跳过当天已签成功的账号,避免把时间浪费在重复请求上。
 pub async fn perform_all_checkin(
     app: &AppHandle,
     client: &reqwest::Client,
     state: &AppState,
     account_interval_secs: u64,
+    skip_checked_today: bool,
 ) -> Vec<(PublicAccount, CheckinResult)> {
     // 1. 取启用账号
     let accounts: Vec<Account> = {
@@ -571,6 +592,9 @@ pub async fn perform_all_checkin(
     let mut pending: Vec<Account> = Vec::new();
     for a in accounts {
         let Some(uid) = effective_user_id(&a) else { continue };
+        if skip_checked_today && a.last_checkin_at.map(checked_in_today).unwrap_or(false) {
+            continue; // 当天已签,补签不重复请求
+        }
         if let Some((_, _, _)) = cooldown::cooldown_of(state, uid, now) {
             continue; // 冷却中跳过
         }
@@ -749,6 +773,28 @@ pub async fn refresh_account_credential(
         Err(AppError::Credential(
             "token 已过期，请打开该账号的 TRAE 实例（TRAE 会自动刷新），刷新后重试".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// checked_in_today 按 Asia/Shanghai 判定:今天 00:00 与 23:59 为真,昨天 23:59 为假
+    #[test]
+    fn checked_in_today_uses_shanghai_date() {
+        let tz = chrono_tz::Asia::Shanghai;
+        let now = chrono::Utc::now().with_timezone(&tz);
+        let today_start = tz
+            .from_local_datetime(&now.date_naive().and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap();
+        let yesterday_end = today_start - chrono::Duration::minutes(1);
+
+        assert!(checked_in_today(today_start.timestamp_millis()));
+        assert!(checked_in_today(now.timestamp_millis()));
+        assert!(!checked_in_today(yesterday_end.timestamp_millis()));
     }
 }
 

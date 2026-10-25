@@ -20,9 +20,32 @@ const DEFAULT_REFRESH_DAYS: i64 = 180;
 /// 多开实例的共享插件目录名(--extensions-dir,省磁盘)
 pub const SHARED_EXTENSIONS_DIR: &str = "TRAE SOLO CN_SharedExtensions";
 
+/// 解析本实例应使用的机器码:优先复用账号已绑定值,其次复用实例目录已有的 machineid 文件,
+/// 两者都必须未被其他账号占用;都不可用则生成新 UUID。
+/// 历史版本导入多开目录时会原样复制目录里的 machineid,导致多个账号共用同一机器码
+/// (服务端按设备维度统计,多账号会被判"该设备绑定的账户数量已达上限" 4017)。
+pub fn resolve_machine_id(
+    stored: Option<&str>,
+    existing_dir_machine_id: Option<&str>,
+    taken_machine_ids: &[String],
+) -> String {
+    let is_free = |m: &str| !m.is_empty() && !taken_machine_ids.iter().any(|t| t == m);
+    stored
+        .filter(|m| is_free(m))
+        .or(existing_dir_machine_id.map(str::trim).filter(|m| is_free(m)))
+        .map(str::to_string)
+        .unwrap_or_else(generate_machine_guid)
+}
+
 /// 为账号启动多开实例:加密写 storage.json + 启动独立 data-dir 的 TRAE。
+/// taken_machine_ids: 其他账号已占用的机器码,用于避免多实例共用同一设备身份。
 /// 返回 data_dir/machine_id(供回写 Account,下次复用同一目录与机器码)。
-pub fn launch_multi(account: &Account, cred: &Credential, exe_path: &str) -> AppResult<LaunchResult> {
+pub fn launch_multi(
+    account: &Account,
+    cred: &Credential,
+    exe_path: &str,
+    taken_machine_ids: &[String],
+) -> AppResult<LaunchResult> {
     let appdata = std::env::var("APPDATA")
         .map_err(|_| AppError::Launch("无法获取 APPDATA 环境变量".into()))?;
     let user_id = if cred.user_id.is_empty() {
@@ -46,12 +69,13 @@ pub fn launch_multi(account: &Account, cred: &Credential, exe_path: &str) -> App
                 .to_string()
         });
 
-    // 2. 机器码:优先复用,否则生成新 UUID(每实例独立,不动系统注册表)
-    let machine_id = account
-        .machine_id
-        .clone()
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(generate_machine_guid);
+    // 2. 机器码:复用已绑定的或目录已有的,但必须与其他账号不重复;重复(历史导入遗留)则重新生成
+    let dir_machine_id = fs::read_to_string(PathBuf::from(&data_dir).join("machineid")).ok();
+    let machine_id = resolve_machine_id(
+        account.machine_id.as_deref(),
+        dir_machine_id.as_deref(),
+        taken_machine_ids,
+    );
 
     let data_path = PathBuf::from(&data_dir);
     fs::create_dir_all(&data_path)
@@ -358,6 +382,36 @@ mod tests {
     use super::*;
     use crate::trae_auth::{decrypt_trae_auth_info, get_trae_desktop_credentials};
 
+    /// 机器码唯一性:空值、被其他账号占用时重新生成;未占用时复用;目录已有身份优先于重新生成
+    #[test]
+    fn resolve_machine_id_avoids_duplicates() {
+        let taken = vec!["dup-machine-id".to_string()];
+
+        // 账号值未占用 -> 复用
+        assert_eq!(
+            resolve_machine_id(Some("free-machine-id"), None, &taken),
+            "free-machine-id"
+        );
+        // 账号值与其他账号重复 -> 新 UUID,且不再是旧值
+        let regenerated = resolve_machine_id(Some("dup-machine-id"), None, &taken);
+        assert_ne!(regenerated, "dup-machine-id");
+        assert!(uuid::Uuid::parse_str(&regenerated).is_ok(), "应生成合法 UUID: {regenerated}");
+        // 账号值重复但目录里已有独立身份 -> 复用目录身份(保留人工修复结果)
+        assert_eq!(
+            resolve_machine_id(Some("dup-machine-id"), Some("dir-unique-id\n"), &taken),
+            "dir-unique-id"
+        );
+        // 目录身份也重复 -> 重新生成
+        let regenerated2 = resolve_machine_id(Some("dup-machine-id"), Some("dup-machine-id"), &taken);
+        assert!(uuid::Uuid::parse_str(&regenerated2).is_ok());
+        // 空值/无值 -> 生成新 UUID
+        let from_empty = resolve_machine_id(Some(""), None, &[]);
+        assert!(uuid::Uuid::parse_str(&from_empty).is_ok());
+        let from_none = resolve_machine_id(None, None, &[]);
+        assert!(uuid::Uuid::parse_str(&from_none).is_ok());
+        assert_ne!(from_empty, from_none, "每次生成应互不相同");
+    }
+
     /// 测试本地写入 iCubeAuthInfo + telemetry.devDeviceId 到目录(生产代码不回写实例目录)
     fn write_test_credential(data_dir: &str, cred: &Credential) {
         let storage_dir = PathBuf::from(data_dir).join("User").join("globalStorage");
@@ -493,7 +547,7 @@ mod tests {
         };
 
         // exe 不存在 -> 启动失败,但 storage.json 应已写入(步骤在启动前)
-        let result = launch_multi(&account, &cred, "Z:/nonexistent/trae.exe");
+        let result = launch_multi(&account, &cred, "Z:/nonexistent/trae.exe", &[]);
         assert!(result.is_err(), "不存在 exe 应启动失败,实际: {result:?}");
 
         let storage_path = tmp_dir.join("User").join("globalStorage").join("storage.json");
@@ -525,5 +579,77 @@ mod tests {
         // 清理临时目录
         let _ = std::fs::remove_dir_all(&tmp_dir);
         eprintln!("[multi] storage.json 加密写入 + 解密回读验证通过");
+    }
+
+    /// 端到端:两个账号共用同一机器码时,第二个实例必须换成不同设备身份(4017 回归测试)。
+    /// 用合成凭据(加密不依赖外部登录态),exe 传不存在路径不会真启动 TRAE。
+    #[test]
+    fn launch_multi_dedupes_shared_machine_id() {
+        let cred = Credential {
+            token: "token".into(),
+            refresh_token: "refresh".into(),
+            expires_at: 9_999_999_999_999,
+            refresh_expires_at: 9_999_999_999_999,
+            device_id: "device".into(),
+            machine_id: "machine".into(),
+            private_key_pem: "pk".into(),
+            public_key_pem: "pub".into(),
+            user_id: "u1".into(),
+            account_name: "tester".into(),
+            host: "https://api.trae.cn".into(),
+            email: None,
+            avatar_url: None,
+            region: Some("CN".into()),
+        };
+        let shared = "0929e143d12044ec627feb22117a9379a2026161b6ae6efbc90b825aa19d9c5b";
+        let base = std::env::temp_dir().join("trae-dedupe-test");
+        let _ = std::fs::remove_dir_all(&base);
+        let dir_a = base.join("a");
+        let dir_b = base.join("b");
+
+        let account = |id: &str, dir: &PathBuf| Account {
+            id: id.into(),
+            name: id.into(),
+            cookie: String::new(),
+            created_at: 0,
+            last_checkin_at: None,
+            last_checkin_result: None,
+            last_checkin_message: None,
+            points: None,
+            enabled: true,
+            desktop_user_id: Some(cred.user_id.clone()),
+            encrypted_credential: None,
+            credential_status: None,
+            data_dir: Some(dir.to_string_lossy().to_string()),
+            machine_id: Some(shared.to_string()),
+            ..Default::default()
+        };
+        // 读取实例目录下的 telemetry.machineId
+        let telemetry = |dir: &PathBuf| -> String {
+            let path = dir.join("User").join("globalStorage").join("storage.json");
+            let json: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            json.get("telemetry.machineId")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string()
+        };
+
+        // 第一个账号:无占用 -> 沿用共用机器码
+        let _ = launch_multi(&account("a", &dir_a), &cred, "Z:/nonexistent/trae.exe", &[]);
+        // 第二个账号:该机器码已被占用 -> 必须生成新机器码
+        let taken = vec![shared.to_string()];
+        let _ = launch_multi(&account("b", &dir_b), &cred, "Z:/nonexistent/trae.exe", &taken);
+
+        let telemetry_a = telemetry(&dir_a);
+        let telemetry_b = telemetry(&dir_b);
+        assert_ne!(
+            telemetry_a, telemetry_b,
+            "共用机器码的两个实例必须落成不同设备身份"
+        );
+        let machineid_b = std::fs::read_to_string(dir_b.join("machineid")).unwrap();
+        assert_ne!(machineid_b.trim(), shared, "冲突机器码不应被复用");
+
+        let _ = std::fs::remove_dir_all(&base);
+        eprintln!("[multi] 共用机器码去重验证通过: {telemetry_a} != {telemetry_b}");
     }
 }

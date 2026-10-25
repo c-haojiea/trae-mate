@@ -4,6 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use chrono::Timelike;
 use chrono_tz::Asia::Shanghai;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
@@ -42,9 +43,17 @@ pub fn start_scheduler(app: AppHandle) {
 
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
+        // 记录本任务最近一次执行日期,避免同一天反复补签
+        let mut last_run_day: Option<chrono::NaiveDate> = None;
         loop {
             if !is_current(&app_clone, my_gen) {
                 break;
+            }
+            // 补签:已过设定时刻(启动晚/休眠错过)且当天仍有未签账号时,立即执行而不等到明天
+            if should_catch_up(&app_clone, last_run_day) {
+                run_auto_checkin(app_clone.clone()).await;
+                last_run_day = Some(today_shanghai());
+                continue;
             }
             let dur = match next_run_duration(&app_clone) {
                 Some(d) => d,
@@ -64,8 +73,64 @@ pub fn start_scheduler(app: AppHandle) {
                 break;
             }
             run_auto_checkin(app_clone.clone()).await;
+            last_run_day = Some(today_shanghai());
         }
     });
+}
+
+fn today_shanghai() -> chrono::NaiveDate {
+    chrono::Utc::now().with_timezone(&Shanghai).date_naive()
+}
+
+/// 是否需要补签:自动签到已开启、已过当天设定时刻、今天还没执行过、且仍有当天未签的启用账号。
+fn should_catch_up(app: &AppHandle, last_run_day: Option<chrono::NaiveDate>) -> bool {
+    let settings = app
+        .state::<AppState>()
+        .inner()
+        .data
+        .lock()
+        .unwrap()
+        .get_settings();
+    if !settings.auto_checkin {
+        return false;
+    }
+    let Some((h, m)) = parse_hhmm(&settings.checkin_time) else {
+        return false;
+    };
+    let now = chrono::Utc::now().with_timezone(&Shanghai);
+    if !past_scheduled_time(now, (h, m)) {
+        return false; // 还没到设定时刻
+    }
+    if last_run_day == Some(now.date_naive()) {
+        return false; // 今天已执行过
+    }
+    crate::checkin::has_unchecked_today(app)
+}
+
+/// 当前时刻是否已过当天设定时刻(分钟粒度,同一分钟视为已到点)
+fn past_scheduled_time(now: chrono::DateTime<chrono_tz::Tz>, (h, m): (u32, u32)) -> bool {
+    (now.hour() as u32) * 60 + (now.minute() as u32) >= h * 60 + m
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn past_scheduled_time_boundaries() {
+        let tz = shanghai_tz();
+        // 2026-10-22 09:00 / 09:14 / 09:15
+        let at = |h, m| tz.with_ymd_and_hms(2026, 10, 22, h, m, 0).unwrap();
+        assert!(!past_scheduled_time(at(8, 59), (9, 14)));
+        assert!(past_scheduled_time(at(9, 14), (9, 14)), "同一分钟视为到点");
+        assert!(past_scheduled_time(at(9, 15), (9, 14)));
+        assert!(!past_scheduled_time(at(0, 0), (9, 14)));
+    }
+
+    fn shanghai_tz() -> chrono_tz::Tz {
+        chrono_tz::Asia::Shanghai
+    }
 }
 
 /// 停止定时任务(增 generation 使当前任务退出)
@@ -106,7 +171,7 @@ async fn run_auto_checkin(app: AppHandle) {
 
     // 自动签到账号间冷却间隔(分钟),最短 3 分钟
     let interval_secs = (settings.auto_checkin_interval_min.max(3) as u64) * 60;
-    let results = perform_all_checkin(&app, client.inner(), state.inner(), interval_secs).await;
+    let results = perform_all_checkin(&app, client.inner(), state.inner(), interval_secs, true).await;
     let success = results.iter().filter(|(_, r)| r.success).count();
     let failed = results.len() - success;
 
