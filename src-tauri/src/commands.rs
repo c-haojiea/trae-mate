@@ -1,6 +1,6 @@
 // Tauri 命令实现。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -772,6 +772,44 @@ pub fn focus_account_instance(id: String, state: State<'_, AppState>) -> AppResu
     }
 }
 
+/// 把临时登录目录迁移为标准实例目录 `TRAE SOLO CN_{userId}`。
+/// 返回 (实际目录, 是否已写入新凭据)。
+/// 目标目录已存在时绝不删除既有内容:仅备份并覆盖 `storage.json`;
+/// 目标实例正在运行时完全不写文件,保留临时目录并返回 false。
+pub(crate) fn relocate_login_dir(
+    appdata: &Path,
+    temp_dir: &Path,
+    user_id: &str,
+    target_running: bool,
+) -> AppResult<(PathBuf, bool)> {
+    let target = appdata.join(format!("{}_{}", trae_machine::DATA_DIR_NAME, user_id));
+    if !target.exists() {
+        std::fs::rename(temp_dir, &target)?;
+        return Ok((target, true));
+    }
+    if target_running {
+        return Ok((target, false));
+    }
+
+    let temp_storage = temp_dir
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+    let target_storage = target.join("User").join("globalStorage").join("storage.json");
+    if temp_storage.exists() {
+        if target_storage.exists() {
+            let backup = target_storage.with_file_name(format!("storage.json.bak_{}", now_ms()));
+            std::fs::copy(&target_storage, &backup)?;
+        }
+        if let Some(parent) = target_storage.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&temp_storage, &target_storage)?;
+    }
+    let _ = std::fs::remove_dir_all(temp_dir);
+    Ok((target, true))
+}
+
 /// 打开新的空白 TRAE 实例供用户登录,后台轮询登录完成后自动导入账号:
 /// 检测登录 -> 读凭据 -> 杀实例 -> 改名临时目录为标准 TRAE SOLO CN_{userId} -> upsert 账号绑定 -> emit 事件。
 #[tauri::command]
@@ -872,18 +910,24 @@ fn wait_login_and_import(app: &AppHandle, appdata: &str, temp_dir: &str) -> serd
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
-    // 改名为标准目录 TRAE SOLO CN_{userId}(目标已存在则先删除旧的)
-    let target_dir =
-        PathBuf::from(appdata).join(format!("{}_{}", trae_machine::DATA_DIR_NAME, user_id));
-    if target_dir.exists() {
-        let _ = std::fs::remove_dir_all(&target_dir);
-    }
-    if let Err(e) = std::fs::rename(temp_dir, &target_dir) {
-        return serde_json::json!({
-            "success": false,
-            "error": format!("改名为标准目录失败: {e}")
-        });
-    }
+    // 迁移临时登录目录到标准目录:目标已存在时只备份并覆盖 storage.json,绝不删除既有实例目录
+    let appdata_path = PathBuf::from(appdata);
+    let temp_path = PathBuf::from(temp_dir);
+    let target_path =
+        appdata_path.join(format!("{}_{}", trae_machine::DATA_DIR_NAME, user_id));
+    let target_running = trae_machine::is_instance_running(&target_path.to_string_lossy()).0;
+    let (data_dir_path, credential_copied) =
+        match relocate_login_dir(&appdata_path, &temp_path, &user_id, target_running) {
+            Ok(v) => v,
+            Err(e) => {
+                return serde_json::json!({
+                    "success": false,
+                    "error": format!("迁移登录目录失败: {e}")
+                })
+            }
+        };
+    let data_dir = data_dir_path.to_string_lossy().to_string();
+    let temp_kept = temp_path.exists();
 
     // upsert 账号(绑定标准目录 + 机器码 + 加密凭据)
     let encrypted = match credentials::encrypt_credential(&cred) {
@@ -910,7 +954,7 @@ fn wait_login_and_import(app: &AppHandle, appdata: &str, temp_dir: &str) -> serd
         desktop_user_id: Some(user_id.clone()),
         encrypted_credential: Some(encrypted),
         credential_status: Some(status.to_string()),
-        data_dir: Some(target_dir.to_string_lossy().to_string()),
+        data_dir: Some(data_dir.clone()),
         machine_id: Some(cred.machine_id.clone()),
         source: AccountSource::Desktop,
         ..Default::default()
@@ -925,7 +969,9 @@ fn wait_login_and_import(app: &AppHandle, appdata: &str, temp_dir: &str) -> serd
     serde_json::json!({
         "success": true,
         "name": cred.account_name,
-        "userId": user_id
+        "userId": user_id,
+        "credentialCopied": credential_copied,
+        "tempKept": temp_kept
     })
 }
 
@@ -1048,4 +1094,116 @@ pub fn import_account_from_dir(
     drop(data);
     let _ = crate::rebuild_tray_menu(&app);
     Ok(saved.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn case_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "trae_mate_a7_relocate_{}_{}",
+            tag,
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_storage(dir: &Path, content: &str) {
+        let folder = dir.join("User").join("globalStorage");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("storage.json"), content).unwrap();
+    }
+
+    fn backups_in(folder: &Path) -> usize {
+        fs::read_dir(folder)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("storage.json.bak_")
+            })
+            .count()
+    }
+
+    #[test]
+    fn relocate_renames_when_target_missing() {
+        let root = case_dir("new");
+        let appdata = root.join("appdata");
+        fs::create_dir_all(&appdata).unwrap();
+        let temp = root.join("TRAE SOLO CN login temp1");
+        write_storage(&temp, "new-storage");
+
+        let expected = appdata.join(format!("{}_1001", trae_machine::DATA_DIR_NAME));
+        let (target, copied) = relocate_login_dir(&appdata, &temp, "1001", false).unwrap();
+
+        assert_eq!(target, expected, "返回标准目录");
+        assert!(copied, "新目录视为已写入凭据");
+        assert!(!temp.exists(), "临时目录已改名");
+        assert_eq!(
+            fs::read_to_string(target.join("User").join("globalStorage").join("storage.json"))
+                .unwrap(),
+            "new-storage"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn relocate_copies_credential_with_backup_when_target_exists() {
+        let root = case_dir("exists");
+        let appdata = root.join("appdata");
+        let target = appdata.join(format!("{}_1002", trae_machine::DATA_DIR_NAME));
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("marker.txt"), "keep").unwrap();
+        write_storage(&target, "old-storage");
+        let temp = root.join("TRAE SOLO CN login temp2");
+        write_storage(&temp, "new-storage");
+
+        let (got, copied) = relocate_login_dir(&appdata, &temp, "1002", false).unwrap();
+
+        assert_eq!(got, target, "返回既有目录而非临时目录");
+        assert!(copied, "凭据已覆盖");
+        assert_eq!(
+            fs::read_to_string(target.join("marker.txt")).unwrap(),
+            "keep",
+            "既有文件不被删除"
+        );
+        let storage_dir = target.join("User").join("globalStorage");
+        assert_eq!(
+            fs::read_to_string(storage_dir.join("storage.json")).unwrap(),
+            "new-storage",
+            "storage.json 已更新"
+        );
+        assert_eq!(backups_in(&storage_dir), 1, "生成 storage.json.bak_* 备份");
+        assert!(!temp.exists(), "临时目录已清理");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn relocate_keeps_temp_when_target_running() {
+        let root = case_dir("running");
+        let appdata = root.join("appdata");
+        let target = appdata.join(format!("{}_1003", trae_machine::DATA_DIR_NAME));
+        fs::create_dir_all(&target).unwrap();
+        write_storage(&target, "old-storage");
+        let temp = root.join("TRAE SOLO CN login temp3");
+        write_storage(&temp, "new-storage");
+
+        let (got, copied) = relocate_login_dir(&appdata, &temp, "1003", true).unwrap();
+
+        assert_eq!(got, target);
+        assert!(!copied, "运行中不写入凭据");
+        assert!(temp.exists(), "临时目录保留");
+        let storage_dir = target.join("User").join("globalStorage");
+        assert_eq!(
+            fs::read_to_string(storage_dir.join("storage.json")).unwrap(),
+            "old-storage",
+            "既有凭据未被覆盖"
+        );
+        assert_eq!(backups_in(&storage_dir), 0, "未产生备份");
+        let _ = fs::remove_dir_all(&root);
+    }
 }

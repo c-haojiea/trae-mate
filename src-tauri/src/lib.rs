@@ -100,7 +100,8 @@ pub fn run() {
             let app_data = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data)?;
             let path = app_data.join("trae-check-data.json");
-            let data = store::StoreData::load(&path).unwrap_or_default();
+            // 失败关闭:数据文件损坏时启动直接报错,避免静默空库后覆盖真实数据
+            let data = store::StoreData::load_checked(&path)?;
             app.manage(store::AppState {
                 data: std::sync::Mutex::new(data),
                 path,

@@ -59,6 +59,25 @@ impl StoreData {
         Ok(store)
     }
 
+    /// 失败关闭加载:文件不存在时视为新库;为空或解析失败时先备份原文件再返回 Err。
+    /// 绝不把损坏文件静默当空库,避免随后一次保存覆盖真实数据。
+    pub fn load_checked(path: &Path) -> AppResult<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = std::fs::read_to_string(path)?;
+        if !raw.trim().is_empty() {
+            if let Ok(store) = serde_json::from_str::<StoreData>(&raw) {
+                return Ok(store);
+            }
+        }
+        let backup = backup_corrupt(path)?;
+        Err(AppError::Launch(format!(
+            "账号数据文件解析失败,已保留备份: {} (原文件未改动)",
+            backup.display()
+        )))
+    }
+
     pub fn save(&self, path: &Path) -> AppResult<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -172,6 +191,24 @@ impl StoreData {
     }
 }
 
+fn unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// 把损坏文件复制为 `<原名>.corrupt_<unix_ms>`,原文件保持不动。
+fn backup_corrupt(path: &Path) -> AppResult<PathBuf> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "trae-check-data.json".to_string());
+    let backup = path.with_file_name(format!("{}.corrupt_{}", name, unix_ms()));
+    std::fs::copy(path, &backup)?;
+    Ok(backup)
+}
+
 /// 生成简单唯一 ID(对应原 Date.now().toString(36) + random)
 pub fn generate_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -244,5 +281,82 @@ mod tests {
         assert_eq!(saved.machine_id.as_deref(), Some("machine-1"), "machineId 未提供时保留旧值");
         assert_eq!(saved.encrypted_credential.as_deref(), Some("new-cred"), "凭据被更新");
         assert_eq!(saved.credential_status.as_deref(), Some("valid"), "凭据状态被更新");
+    }
+
+    fn case_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "trae_mate_a7_store_{}_{}",
+            tag,
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn corrupt_backups(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("trae-check-data.json.corrupt_")
+            })
+            .count()
+    }
+
+    #[test]
+    fn load_checked_defaults_when_file_missing() {
+        let dir = case_dir("missing");
+        let store = StoreData::load_checked(&dir.join("none.json")).unwrap();
+        assert!(store.accounts.is_empty(), "文件不存在视为新库");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_checked_parses_valid_json() {
+        let dir = case_dir("valid");
+        let path = dir.join("trae-check-data.json");
+        let mut store = StoreData::default();
+        store
+            .accounts
+            .push(sample_account(Some(r"C:\X\TRAE SOLO CN_1"), "cred", "valid"));
+        store.save(&path).unwrap();
+
+        let loaded = StoreData::load_checked(&path).unwrap();
+        assert_eq!(loaded.accounts.len(), 1);
+        assert_eq!(loaded.accounts[0].id, "keep-id");
+        assert!(path.exists(), "合法文件保持原样");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_checked_backs_up_corrupt_json() {
+        let dir = case_dir("corrupt");
+        let path = dir.join("trae-check-data.json");
+        let broken: &[u8] = br#"{"accounts": [{"id": "x""#;
+        std::fs::write(&path, broken).unwrap();
+
+        let err = StoreData::load_checked(&path).unwrap_err();
+        assert!(err.to_string().contains("已保留备份"), "错误文案可读: {err}");
+        assert_eq!(std::fs::read(&path).unwrap(), broken.to_vec(), "原文件字节不变");
+        assert_eq!(corrupt_backups(&dir), 1, "生成一个 corrupt 备份");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_checked_backs_up_empty_file() {
+        let dir = case_dir("empty");
+        let path = dir.join("trae-check-data.json");
+        std::fs::write(&path, "   \n").unwrap();
+
+        assert!(StoreData::load_checked(&path).is_err(), "空文件按损坏处理");
+        assert_eq!(corrupt_backups(&dir), 1, "空文件也生成备份");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "   \n",
+            "原文件未改动"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
