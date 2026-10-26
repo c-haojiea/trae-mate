@@ -131,7 +131,8 @@ pub fn import_desktop_account(state: State<'_, AppState>) -> AppResult<PublicAcc
         desktop_user_id: Some(cred.user_id.clone()),
         encrypted_credential: Some(encrypted),
         credential_status: Some(status.to_string()),
-        data_dir: None,
+        data_dir: trae_machine::instance_data_dir_for_current_user(&cred.user_id)
+            .map(|p| p.to_string_lossy().to_string()),
         machine_id: None,
         source: AccountSource::Desktop,
         ..Default::default()

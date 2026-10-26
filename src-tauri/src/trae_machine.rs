@@ -344,6 +344,25 @@ pub fn main_data_dir() -> AppResult<PathBuf> {
     resolve_main_data_dir()
 }
 
+/// 指定实例数据目录(root/TRAE SOLO CN_<userId>),仅在该目录已存在且含 storage.json 时返回
+pub fn instance_data_dir_for_user(root: &Path, user_id: &str) -> Option<PathBuf> {
+    if user_id.is_empty() {
+        return None;
+    }
+    let dir = root.join(format!("{DATA_DIR_NAME}_{user_id}"));
+    if dir.join("User").join("globalStorage").join("storage.json").exists() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// 当前 %APPDATA% 下该 userId 的实例数据目录(取环境变量与探测拆两步,便于单测)
+pub fn instance_data_dir_for_current_user(user_id: &str) -> Option<PathBuf> {
+    let root = std::env::var("APPDATA").ok()?;
+    instance_data_dir_for_user(Path::new(&root), user_id)
+}
+
 /// 账号实例运行来源
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -503,5 +522,44 @@ mod tests {
     fn generate_machine_guid_is_uuid() {
         let g = generate_machine_guid();
         assert!(Uuid::parse_str(&g).is_ok(), "机器码应为合法 UUID: {g}");
+    }
+
+    #[test]
+    fn instance_dir_lookup_requires_storage_json() {
+        let root = std::env::temp_dir().join(format!("trae_mate_a5_lookup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // 含 storage.json 的实例目录
+        let with_storage = root
+            .join(format!("{DATA_DIR_NAME}_1001"))
+            .join("User")
+            .join("globalStorage");
+        std::fs::create_dir_all(&with_storage).unwrap();
+        std::fs::write(with_storage.join("storage.json"), "{}").unwrap();
+
+        // 目录存在但无 storage.json
+        let without_storage = root
+            .join(format!("{DATA_DIR_NAME}_1002"))
+            .join("User")
+            .join("globalStorage");
+        std::fs::create_dir_all(&without_storage).unwrap();
+
+        assert_eq!(
+            instance_data_dir_for_user(&root, "1001"),
+            Some(root.join(format!("{DATA_DIR_NAME}_1001"))),
+            "有 storage.json 应返回目录"
+        );
+        assert_eq!(
+            instance_data_dir_for_user(&root, "1002"),
+            None,
+            "无 storage.json 应返回 None"
+        );
+        assert_eq!(
+            instance_data_dir_for_user(&root, "1003"),
+            None,
+            "目录不存在应返回 None"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
