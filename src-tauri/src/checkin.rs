@@ -2,6 +2,8 @@
 // 解析凭据(desktop 实例回读 / jwt 存储) → 稳定伪设备ID → 完整请求头 → status/claim
 // → 错误分类冷却状态机 → 积分历史。直连 api.trae.cn(reqwest 默认不读系统代理,天然绕过本地代理)。
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -32,14 +34,60 @@ pub fn checked_in_today(ms: i64) -> bool {
     dt.with_timezone(&tz).date_naive() == chrono::Utc::now().with_timezone(&tz).date_naive()
 }
 
-/// 是否还有当天未签到的启用账号(补签判断用)
+/// 是否还有当天未签到的启用账号(补签判断用)。
+/// 跳过冷却中的账号(含永久 SessionDead)与无有效 user_id 的账号,避免无限重试。
 pub fn has_unchecked_today(app: &AppHandle) -> bool {
     let state = app.state::<AppState>();
+    let now = chrono::Utc::now().timestamp();
     let data = state.inner().data.lock().unwrap();
     data.get_accounts()
         .iter()
         .filter(|a| a.enabled)
+        .filter(|a| {
+            effective_user_id(a)
+                .map(|uid| cooldown::cooldown_of(state.inner(), uid, now).is_none())
+                .unwrap_or(false)
+        })
         .any(|a| a.last_checkin_at.map(|ms| !checked_in_today(ms)).unwrap_or(true))
+}
+
+// ===== 批次互斥与中断 =====
+
+/// 批次互斥守卫:Drop 时释放 running,保证异常路径也能解除占用。
+pub(crate) struct BatchGuard {
+    running: Arc<AtomicBool>,
+}
+
+impl Drop for BatchGuard {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 尝试占用批次互斥位;已有批次执行时返回 None。
+pub(crate) fn try_begin(running: &Arc<AtomicBool>) -> Option<BatchGuard> {
+    if running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        Some(BatchGuard { running: running.clone() })
+    } else {
+        None
+    }
+}
+
+/// 可中断等待:每 250ms 检查取消标志,被取消返回 false。
+pub async fn sleep_interruptible(cancel: &AtomicBool, total: Duration) -> bool {
+    let mut remaining = total;
+    while remaining > Duration::ZERO {
+        if cancel.load(Ordering::SeqCst) {
+            return false;
+        }
+        let step = remaining.min(Duration::from_millis(250));
+        tokio::time::sleep(step).await;
+        remaining = remaining.saturating_sub(step);
+    }
+    !cancel.load(Ordering::SeqCst)
 }
 
 fn api_succeeded(data: &Value) -> bool {
@@ -580,7 +628,15 @@ pub async fn perform_all_checkin(
     state: &AppState,
     account_interval_secs: u64,
     skip_checked_today: bool,
-) -> Vec<(PublicAccount, CheckinResult)> {
+) -> Result<Vec<(PublicAccount, CheckinResult)>, String> {
+    // 0. 批次互斥:手动与定时并发触发时只允许一个批次执行
+    let scheduler = app.state::<crate::scheduler::SchedulerState>();
+    let running = scheduler.inner().running.clone();
+    let cancel = scheduler.inner().cancel.clone();
+    let _guard = match try_begin(&running) {
+        Some(g) => g,
+        None => return Err("已有签到批次正在执行,请等待完成".into()),
+    };
     // 1. 取启用账号
     let accounts: Vec<Account> = {
         let data = state.data.lock().unwrap();
@@ -639,6 +695,9 @@ pub async fn perform_all_checkin(
     let mut already = 0usize;
     let mut failed = 0usize;
     for (i, account) in pending.iter().enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            break; // 已取消:后续账号不再执行,也不写 lastCheckinAt
+        }
         let outcome = checkin_engine(state, account, client).await;
         emit_progress(app, i + 1, pending.len(), account, &outcome);
         match outcome.action.as_str() {
@@ -678,10 +737,19 @@ pub async fn perform_all_checkin(
         }
 
         if i + 1 < pending.len() {
-            tokio::time::sleep(Duration::from_secs(account_interval_secs)).await;
+            // 账号间隔改为可中断等待:收到取消立即结束本批次
+            if !sleep_interruptible(&cancel, Duration::from_secs(account_interval_secs)).await {
+                break;
+            }
         }
     }
     emit_done(app, ok, already, failed);
+    if cancel.load(Ordering::SeqCst) {
+        let _ = app.emit(
+            "checkin-cancelled",
+            json!({ "done": results.len(), "total": pending.len() }),
+        );
+    }
 
     // 写批次摘要
     let summary = crate::models::CheckinSummary {
@@ -703,7 +771,7 @@ pub async fn perform_all_checkin(
     };
     let _ = crate::fs_utils::write_json(&state.data_path("checkin_summary.json"), &summary);
 
-    results
+    Ok(results)
 }
 
 // ===== 积分查询 =====
@@ -795,6 +863,37 @@ mod tests {
         assert!(checked_in_today(today_start.timestamp_millis()));
         assert!(checked_in_today(now.timestamp_millis()));
         assert!(!checked_in_today(yesterday_end.timestamp_millis()));
+    }
+
+    /// 取消信号已置位时,可中断等待应立即返回 false
+    #[tokio::test]
+    async fn sleep_interruptible_returns_false_when_cancelled() {
+        let cancel = AtomicBool::new(true);
+        let started = std::time::Instant::now();
+        assert!(!sleep_interruptible(&cancel, Duration::from_secs(30)).await);
+        assert!(started.elapsed() < Duration::from_secs(1), "不应真的等 30s");
+    }
+
+    /// 未取消时等待完成返回 true
+    #[tokio::test]
+    async fn sleep_interruptible_returns_true_when_not_cancelled() {
+        let cancel = AtomicBool::new(false);
+        assert!(
+            sleep_interruptible(&cancel, Duration::from_millis(50)).await,
+            "未被取消应返回 true"
+        );
+    }
+
+    /// 批次互斥:已占用时 try_begin 返回 None,释放后可再次占用
+    #[test]
+    fn try_begin_is_mutually_exclusive() {
+        let running = Arc::new(AtomicBool::new(false));
+        let guard = try_begin(&running).expect("首次应获取成功");
+        assert!(running.load(Ordering::SeqCst));
+        assert!(try_begin(&running).is_none(), "占用中不得重入");
+        drop(guard);
+        assert!(!running.load(Ordering::SeqCst), "守卫 Drop 后释放");
+        assert!(try_begin(&running).is_some(), "释放后可再次占用");
     }
 }
 

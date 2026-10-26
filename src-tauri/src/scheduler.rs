@@ -1,34 +1,48 @@
 // 定时签到调度器。用 generation 计数控制任务生命周期(无需 abort),
 // tokio 分段 sleep 以便及时响应 stop。时区 Asia/Shanghai。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Timelike;
 use chrono_tz::Asia::Shanghai;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
 
-use crate::checkin::perform_all_checkin;
+use crate::checkin::{perform_all_checkin, sleep_interruptible};
 use crate::models::AppSettings;
 use crate::store::AppState;
 
+/// 当天补签重试间隔与最大尝试次数
+pub(crate) const RETRY_DELAY_SECS: u64 = 30 * 60;
+pub(crate) const MAX_ATTEMPTS_PER_DAY: u32 = 3;
+
 pub struct SchedulerState {
     pub generation: Arc<AtomicU64>,
+    /// 取消信号:stop 时置 true,批次内逐账号检查以中断
+    pub cancel: Arc<AtomicBool>,
+    /// 批次互斥:同一时刻只允许一个签到批次执行
+    pub running: Arc<AtomicBool>,
 }
 
 impl Default for SchedulerState {
     fn default() -> Self {
         SchedulerState {
             generation: Arc::new(AtomicU64::new(0)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 /// 启动定时任务(若已开启自动签到)。每次调用增 generation,旧任务自行退出。
 pub fn start_scheduler(app: AppHandle) {
-    let gen = app.state::<SchedulerState>().inner().generation.clone();
+    let state = app.state::<SchedulerState>();
+    let gen = state.inner().generation.clone();
+    let cancel = state.inner().cancel.clone();
     let my_gen = gen.fetch_add(1, Ordering::SeqCst) + 1;
+    cancel.store(false, Ordering::SeqCst);
 
     let settings = app
         .state::<AppState>()
@@ -43,47 +57,69 @@ pub fn start_scheduler(app: AppHandle) {
 
     let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
-        // 记录本任务最近一次执行日期,避免同一天反复补签
-        let mut last_run_day: Option<chrono::NaiveDate> = None;
+        // 当天已执行批次次数与日期:上海日期变化后 attempts 归零
+        let mut attempt_day: Option<chrono::NaiveDate> = None;
+        let mut attempts: u32 = 0;
         loop {
             if !is_current(&app_clone, my_gen) {
                 break;
             }
-            // 补签:已过设定时刻(启动晚/休眠错过)且当天仍有未签账号时,立即执行而不等到明天
-            if should_catch_up(&app_clone, last_run_day) {
-                run_auto_checkin(app_clone.clone()).await;
-                last_run_day = Some(today_shanghai());
-                continue;
+            let today = today_shanghai();
+            if attempt_day != Some(today) {
+                attempt_day = Some(today);
+                attempts = 0;
             }
-            let dur = match next_run_duration(&app_clone) {
-                Some(d) => d,
-                None => break,
-            };
-            // 分段 sleep,每 15s 检查 generation,及时响应 stop/restart
-            let mut remaining = dur;
-            while remaining > std::time::Duration::ZERO {
-                if !is_current(&app_clone, my_gen) {
-                    break;
+            let (past_time, unchecked) = catch_up_state(&app_clone);
+            match next_action(past_time, attempts, unchecked) {
+                Plan::RunNow => {
+                    run_auto_checkin(app_clone.clone()).await;
+                    attempts += 1;
+                    if cancel.load(Ordering::SeqCst) {
+                        break; // 批次被 stop 中断:停止排程
+                    }
                 }
-                let step = remaining.min(std::time::Duration::from_secs(15));
-                tokio::time::sleep(step).await;
-                remaining = remaining.saturating_sub(step);
+                Plan::RetryIn(dur) => {
+                    if !sleep_interruptible(&cancel, dur).await {
+                        break;
+                    }
+                }
+                Plan::SleepToNextDay => {
+                    // 签到时间非法(配置损坏)时不退出线程:10 分钟后重试,配置改好后自愈
+                    let dur = next_run_duration(&app_clone).unwrap_or(Duration::from_secs(600));
+                    if !sleep_interruptible(&cancel, dur).await {
+                        break;
+                    }
+                }
             }
-            if !is_current(&app_clone, my_gen) {
-                break;
-            }
-            run_auto_checkin(app_clone.clone()).await;
-            last_run_day = Some(today_shanghai());
         }
     });
 }
 
-fn today_shanghai() -> chrono::NaiveDate {
-    chrono::Utc::now().with_timezone(&Shanghai).date_naive()
+/// 主循环动作(纯决策,便于单测)
+#[derive(Debug, PartialEq)]
+pub(crate) enum Plan {
+    RunNow,
+    RetryIn(Duration),
+    SleepToNextDay,
 }
 
-/// 是否需要补签:自动签到已开启、已过当天设定时刻、今天还没执行过、且仍有当天未签的启用账号。
-fn should_catch_up(app: &AppHandle, last_run_day: Option<chrono::NaiveDate>) -> bool {
+/// 根据当前状态决定下一步:未到点/已用尽次数→睡到明天;
+/// 到点且当天未跑→立即执行;已跑但仍有未签→30 分钟后重试。
+pub(crate) fn next_action(past_time: bool, attempts: u32, unchecked: bool) -> Plan {
+    if !past_time {
+        return Plan::SleepToNextDay;
+    }
+    if attempts == 0 {
+        return Plan::RunNow;
+    }
+    if unchecked && attempts < MAX_ATTEMPTS_PER_DAY {
+        return Plan::RetryIn(Duration::from_secs(RETRY_DELAY_SECS));
+    }
+    Plan::SleepToNextDay
+}
+
+/// 补签状态:是否已过当天签到时刻、今天是否仍有未签账号
+fn catch_up_state(app: &AppHandle) -> (bool, bool) {
     let settings = app
         .state::<AppState>()
         .inner()
@@ -92,19 +128,17 @@ fn should_catch_up(app: &AppHandle, last_run_day: Option<chrono::NaiveDate>) -> 
         .unwrap()
         .get_settings();
     if !settings.auto_checkin {
-        return false;
+        return (false, false);
     }
     let Some((h, m)) = parse_hhmm(&settings.checkin_time) else {
-        return false;
+        return (false, false);
     };
     let now = chrono::Utc::now().with_timezone(&Shanghai);
-    if !past_scheduled_time(now, (h, m)) {
-        return false; // 还没到设定时刻
-    }
-    if last_run_day == Some(now.date_naive()) {
-        return false; // 今天已执行过
-    }
-    crate::checkin::has_unchecked_today(app)
+    (past_scheduled_time(now, (h, m)), crate::checkin::has_unchecked_today(app))
+}
+
+fn today_shanghai() -> chrono::NaiveDate {
+    chrono::Utc::now().with_timezone(&Shanghai).date_naive()
 }
 
 /// 当前时刻是否已过当天设定时刻(分钟粒度,同一分钟视为已到点)
@@ -128,17 +162,50 @@ mod tests {
         assert!(!past_scheduled_time(at(0, 0), (9, 14)));
     }
 
+    #[test]
+    fn validate_hhmm_accepts_valid() {
+        assert!(validate_hhmm("08:30"));
+        assert!(validate_hhmm("00:00"));
+        assert!(validate_hhmm("23:59"));
+    }
+
+    #[test]
+    fn validate_hhmm_rejects_invalid() {
+        assert!(!validate_hhmm("8:30"));
+        assert!(!validate_hhmm("24:00"));
+        assert!(!validate_hhmm("08:60"));
+        assert!(!validate_hhmm(""));
+    }
+
+    #[test]
+    fn parse_hhmm_matches_validation() {
+        assert_eq!(parse_hhmm("08:30"), Some((8, 30)));
+        assert_eq!(parse_hhmm("8:30"), None);
+        assert_eq!(parse_hhmm("24:00"), None);
+        assert_eq!(parse_hhmm("08:60"), None);
+        assert_eq!(parse_hhmm(""), None);
+    }
+
+    #[test]
+    fn next_action_covers_all_plans() {
+        assert_eq!(next_action(true, 0, true), Plan::RunNow, "到点未跑立即执行");
+        assert_eq!(next_action(true, 1, true), Plan::RetryIn(Duration::from_secs(RETRY_DELAY_SECS)));
+        assert_eq!(next_action(true, 2, true), Plan::RetryIn(Duration::from_secs(RETRY_DELAY_SECS)));
+        assert_eq!(next_action(true, 3, true), Plan::SleepToNextDay, "达上限不再重试");
+        assert_eq!(next_action(true, 1, false), Plan::SleepToNextDay, "无未签账号不再重试");
+        assert_eq!(next_action(false, 0, true), Plan::SleepToNextDay, "未到点睡到明天");
+    }
+
     fn shanghai_tz() -> chrono_tz::Tz {
         chrono_tz::Asia::Shanghai
     }
 }
 
-/// 停止定时任务(增 generation 使当前任务退出)
+/// 停止定时任务(增 generation 使当前任务退出;置 cancel 真正中断进行中的批次)
 pub fn stop_scheduler(app: &AppHandle) {
-    app.state::<SchedulerState>()
-        .inner()
-        .generation
-        .fetch_add(1, Ordering::SeqCst);
+    let state = app.state::<SchedulerState>();
+    state.inner().generation.fetch_add(1, Ordering::SeqCst);
+    state.inner().cancel.store(true, Ordering::SeqCst);
 }
 
 /// 下次执行时间(ISO8601),未启用返回 None
@@ -171,7 +238,19 @@ async fn run_auto_checkin(app: AppHandle) {
 
     // 自动签到账号间冷却间隔(分钟),最短 3 分钟
     let interval_secs = (settings.auto_checkin_interval_min.max(3) as u64) * 60;
-    let results = perform_all_checkin(&app, client.inner(), state.inner(), interval_secs, true).await;
+    let results = match perform_all_checkin(
+        &app,
+        client.inner(),
+        state.inner(),
+        interval_secs,
+        true,
+    )
+    .await
+    {
+        Ok(r) => r,
+        // 已有批次在跑等抢占失败:不通知,交由主循环下一轮处理
+        Err(_) => return,
+    };
     let success = results.iter().filter(|(_, r)| r.success).count();
     let failed = results.len() - success;
 
@@ -229,8 +308,22 @@ fn next_run_duration(app: &AppHandle) -> Option<std::time::Duration> {
 }
 
 fn parse_hhmm(s: &str) -> Option<(u32, u32)> {
-    let mut parts = s.split(':');
-    let h: u32 = parts.next()?.parse().ok()?;
-    let m: u32 = parts.next()?.parse().ok()?;
+    let bytes = s.as_bytes();
+    if bytes.len() != 5 || bytes[2] != b':' {
+        return None; // 严格要求两位时/分
+    }
+    if !bytes[..2].iter().all(|c| c.is_ascii_digit()) || !bytes[3..].iter().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let h: u32 = s[..2].parse().ok()?;
+    let m: u32 = s[3..].parse().ok()?;
+    if h > 23 || m > 59 {
+        return None; // 范围校验
+    }
     Some((h, m))
+}
+
+/// 严格校验签到时间:HH:MM,两位时/分,00:00-23:59
+pub(crate) fn validate_hhmm(s: &str) -> bool {
+    parse_hhmm(s).is_some()
 }

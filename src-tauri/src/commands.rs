@@ -251,7 +251,9 @@ pub async fn checkin_all(
 ) -> AppResult<Vec<(PublicAccount, CheckinResult)>> {
     // 手动一键签到:账号间保持 2s 快速执行(自动定时签到用可配置的分钟级间隔,见 scheduler)
     // 手动不跳过当天已签账号,保证用户主动点击时能看到每个账号的真实状态
-    Ok(checkin::perform_all_checkin(&app, client.inner(), state.inner(), 2, false).await)
+    checkin::perform_all_checkin(&app, client.inner(), state.inner(), 2, false)
+        .await
+        .map_err(AppError::Launch)
 }
 
 #[tauri::command]
@@ -510,6 +512,14 @@ pub fn save_settings(
     app: AppHandle,
 ) -> AppResult<AppSettings> {
     let has_launch = settings.launch_at_login.is_some();
+    // 先校验签到时间:非法配置直接拒绝,不写盘也不重启调度
+    if let Some(t) = settings.checkin_time.as_deref() {
+        if !scheduler::validate_hhmm(t) {
+            return Err(AppError::Launch(
+                "签到时间格式无效,应为 HH:MM(00:00-23:59)".into(),
+            ));
+        }
+    }
     let mut data = state.data.lock().unwrap();
     let s = data.save_settings(settings);
     data.save(&state.path)?;
