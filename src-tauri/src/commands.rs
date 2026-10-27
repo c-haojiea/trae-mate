@@ -565,6 +565,23 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 账号是否已有可用的绑定实例目录(目录内存在 User\globalStorage\storage.json)。
+/// 可用时必须用该目录启动,否则会落到主目录、看不到该账号的聊天记录。
+fn bound_dir_usable(account: &Account) -> bool {
+    account
+        .data_dir
+        .as_deref()
+        .filter(|d| !d.is_empty())
+        .map(|d| {
+            std::path::Path::new(d)
+                .join("User")
+                .join("globalStorage")
+                .join("storage.json")
+                .is_file()
+        })
+        .unwrap_or(false)
+}
+
 /// 启动账号独立实例(前端命令与托盘点击共用核心逻辑):
 /// 解密凭据 -> 解析 exe -> 启动 -> 回写 data_dir/machine_id -> 刷新托盘菜单
 pub fn launch_account_by_id(app: &AppHandle, account_id: &str) -> AppResult<LaunchResult> {
@@ -579,12 +596,18 @@ pub fn launch_account_by_id(app: &AppHandle, account_id: &str) -> AppResult<Laun
     }
     .ok_or_else(|| AppError::NotFound(account_id.into()))?;
 
+    // 已有可用绑定目录时一律用绑定目录启动(含主账号),保证聊天记录/登录态落在同一目录
+    let use_bound_dir = bound_dir_usable(&account);
+
     // 防护:该账号已在主实例运行则拒绝启动(避免同账号双实例挤掉登录态、丢账号数据)
+    //        走绑定目录时该防护不成立:绑定目录与主目录本就是两个实例
     let main = trae_machine::probe_main_instance();
-    if matches!(
-        trae_machine::account_state(&account, &main),
-        trae_machine::InstanceSource::Main
-    ) {
+    if !use_bound_dir
+        && matches!(
+            trae_machine::account_state(&account, &main),
+            trae_machine::InstanceSource::Main
+        )
+    {
         return Err(AppError::Launch(
             "该账号已在主实例运行,请聚焦主实例而非重复启动".into(),
         ));
@@ -597,13 +620,14 @@ pub fn launch_account_by_id(app: &AppHandle, account_id: &str) -> AppResult<Laun
         .map_err(|e| AppError::Launch(format!("获取配置目录失败: {e}")))?;
     let exe_path = trae_machine::resolve_trae_path(&config_dir)?;
 
-    // 3. 主实例账号(主目录当前登录账号)用主目录启动,复用主实例登录态;否则独立目录多开。
+    // 3. 无可用绑定目录的主实例账号用主目录启动,复用主实例登录态;其余一律独立目录多开。
     //    主目录 userId 取自主目录 storage.json(主实例关闭后仍残留最后登录账号),实现"固定绑定主目录"。
-    let is_main_account = main.1.as_deref()
-        == account
-            .desktop_user_id
-            .as_deref()
-            .filter(|s| !s.is_empty());
+    let is_main_account = !use_bound_dir
+        && main.1.as_deref()
+            == account
+                .desktop_user_id
+                .as_deref()
+                .filter(|s| !s.is_empty());
     if is_main_account {
         let appdata = std::env::var("APPDATA")
             .map_err(|_| AppError::Launch("无法获取 APPDATA 环境变量".into()))?;
@@ -1214,6 +1238,51 @@ mod tests {
             "既有凭据未被覆盖"
         );
         assert_eq!(backups_in(&storage_dir), 0, "未产生备份");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// dataDir 缺失或为空:视为无可用绑定目录,应回落到主目录
+    #[test]
+    fn bound_dir_usable_is_false_without_data_dir() {
+        let none = Account::default();
+        assert!(!bound_dir_usable(&none), "无 dataDir");
+
+        let empty = Account {
+            data_dir: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(!bound_dir_usable(&empty), "dataDir 为空串");
+    }
+
+    /// 目录存在但缺 User\globalStorage\storage.json:该目录未完成登录,不可用
+    #[test]
+    fn bound_dir_usable_is_false_without_storage_json() {
+        let root = case_dir("bound_missing");
+        let dir = root.join("TRAE SOLO CN_2001");
+        fs::create_dir_all(dir.join("User").join("globalStorage")).unwrap();
+
+        let account = Account {
+            data_dir: Some(dir.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        assert!(!bound_dir_usable(&account), "缺 storage.json");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 目录含 storage.json:可用,必须优先用该目录启动(含主账号)
+    #[test]
+    fn bound_dir_usable_is_true_with_storage_json() {
+        let root = case_dir("bound_ok");
+        let dir = root.join("TRAE SOLO CN_2002");
+        write_storage(&dir, "{}");
+
+        let account = Account {
+            data_dir: Some(dir.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        assert!(bound_dir_usable(&account), "storage.json 存在即可用");
+
         let _ = fs::remove_dir_all(&root);
     }
 }

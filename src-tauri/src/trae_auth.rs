@@ -517,6 +517,20 @@ mod tests {
             eprintln!("[trae_auth] 未找到 TRAE storage.json,跳过");
             return;
         }
+        // 主目录可能处于未登录状态(启动过的账号已登出),此时不存在可解密样本:
+        // 跳过而不是误报失败;一旦样本存在,仍走真实解密路径并断言
+        let raw = std::fs::read_to_string(&path).expect("读取本机 storage.json 失败");
+        let storage: serde_json::Value =
+            serde_json::from_str(&raw).expect("解析本机 storage.json 失败");
+        let has_sample = storage
+            .get("iCubeAuthInfo://icube.cloudide")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if !has_sample {
+            eprintln!("[trae_auth] 跳过：本机主目录当前未登录，缺少真实 storage 样本");
+            return;
+        }
         let cred = match get_trae_desktop_credentials() {
             Ok(c) => c,
             Err(e) => panic!("[trae_auth] 解密失败: {e}"),
