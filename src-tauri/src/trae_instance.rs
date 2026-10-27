@@ -37,6 +37,39 @@ pub fn resolve_machine_id(
         .unwrap_or_else(generate_machine_guid)
 }
 
+/// 目录 machineid 选择:目录已有非空值则原样只读使用(不覆盖、不参与去重);
+/// 仅当文件缺失(或为空)时,才复用账号绑定值(未被其他账号占用)或生成新 UUID。
+/// TRAE 的刷新令牌绑定签发时的设备身份,改写既有目录的设备标识会导致 20403。
+fn choose_dir_machine_id(
+    dir_value: Option<&str>,
+    account_value: Option<&str>,
+    taken_machine_ids: &[String],
+) -> String {
+    if let Some(v) = dir_value.map(str::trim).filter(|m| !m.is_empty()) {
+        return v.to_string();
+    }
+    // 目录缺失(machineid 不存在或为空):按「账号值未被占用则复用,否则生成」处理
+    resolve_machine_id(account_value.map(str::trim), None, taken_machine_ids)
+}
+
+/// telemetry.machineId:已有非空值则保留,缺失才由 machineid 派生。
+fn choose_telemetry_machine_id(existing: Option<&str>, machine_id: &str) -> String {
+    existing
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| telemetry_machine_id(machine_id))
+}
+
+/// telemetry.devDeviceId:已有非空值则保留,缺失才生成 UUID。
+fn choose_dev_device_id(existing: Option<&str>) -> String {
+    existing
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
 /// 为账号启动多开实例:加密写 storage.json + 启动独立 data-dir 的 TRAE。
 /// taken_machine_ids: 其他账号已占用的机器码,用于避免多实例共用同一设备身份。
 /// 返回 data_dir/machine_id(供回写 Account,下次复用同一目录与机器码)。
@@ -69,19 +102,27 @@ pub fn launch_multi(
                 .to_string()
         });
 
-    // 2. 机器码:复用已绑定的或目录已有的,但必须与其他账号不重复;重复(历史导入遗留)则重新生成
+    // 2. 机器码:目录已有非空 machineid 时原样只读使用(不覆盖、不参与去重);
+    //    仅当文件缺失时才复用账号绑定值或生成,并写入新目录
     let dir_machine_id = fs::read_to_string(PathBuf::from(&data_dir).join("machineid")).ok();
-    let machine_id = resolve_machine_id(
-        account.machine_id.as_deref(),
+    let has_dir_machine_id = dir_machine_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .is_some();
+    let machine_id = choose_dir_machine_id(
         dir_machine_id.as_deref(),
+        account.machine_id.as_deref(),
         taken_machine_ids,
     );
 
     let data_path = PathBuf::from(&data_dir);
     fs::create_dir_all(&data_path)
         .map_err(|e| AppError::Launch(format!("创建实例数据目录失败: {e}")))?;
-    fs::write(data_path.join("machineid"), &machine_id)
-        .map_err(|e| AppError::Launch(format!("写入机器码失败: {e}")))?;
+    if !has_dir_machine_id {
+        fs::write(data_path.join("machineid"), &machine_id)
+            .map_err(|e| AppError::Launch(format!("写入机器码失败: {e}")))?;
+    }
 
     // 3. 构建 iCubeAuthInfo 明文(抽为 build_auth_info,launch 写入与刷新回写共用)
     let auth_info = build_auth_info(cred);
@@ -130,13 +171,13 @@ pub fn launch_multi(
     obj.remove("iCubeServerData://icube.cloudide");
     obj.remove("iCubeAuthInfo://usertag");
 
-    // 更新 telemetry(machineId 派生自 machineid;devDeviceId/sqmId 每个实例独立且持久,
-    // 首次生成后复用)。绝不能注入主账号的设备 id——服务端按设备维度做限额,
-    // 多个账号共用同一设备 id 领取会被判"操作太过频繁"(code 9074)。
-    obj.insert(
-        "telemetry.machineId".into(),
-        Value::String(telemetry_machine_id(&machine_id)),
+    // 更新 telemetry:已存在的设备标识一律保留(改写会让 TRAE 刷新令牌判定设备不匹配 20403),
+    // 缺失时才补齐。machineId 缺失时由 machineid 派生;devDeviceId 缺失时生成独立 UUID。
+    let telemetry_machine = choose_telemetry_machine_id(
+        obj.get("telemetry.machineId").and_then(|v| v.as_str()),
+        &machine_id,
     );
+    obj.insert("telemetry.machineId".into(), Value::String(telemetry_machine));
     let sqm_id = obj
         .get("telemetry.sqmId")
         .and_then(|v| v.as_str())
@@ -144,16 +185,9 @@ pub fn launch_multi(
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{{{}}}", uuid::Uuid::new_v4().to_string().to_uppercase()));
     obj.insert("telemetry.sqmId".into(), Value::String(sqm_id));
-    // 工具实例设备 id:首次生成后持久复用;若已被污染为与主目录相同的设备 id
-    // (早期版本误注入主账号设备 id 所致),强制重新生成独立 UUID。
-    let main_dev = crate::trae_auth::read_main_telemetry_device_id();
-    let dev_device_id = obj
-        .get("telemetry.devDeviceId")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .filter(|s| main_dev.as_deref() != Some(s.as_str()))
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let dev_device_id = choose_dev_device_id(
+        obj.get("telemetry.devDeviceId").and_then(|v| v.as_str()),
+    );
     obj.insert("telemetry.devDeviceId".into(), Value::String(dev_device_id));
 
     // 加密写 iCubeAuthInfo(entitlement 明文不加密)
@@ -410,6 +444,58 @@ mod tests {
         let from_none = resolve_machine_id(None, None, &[]);
         assert!(uuid::Uuid::parse_str(&from_none).is_ok());
         assert_ne!(from_empty, from_none, "每次生成应互不相同");
+    }
+
+    /// 目录已有 machineid 时即使与其他账号重复也原样使用(只读,不重新生成)
+    #[test]
+    fn dir_machine_id_is_kept_even_if_shared() {
+        let taken = vec!["dup-machine-id".to_string()];
+        assert_eq!(
+            choose_dir_machine_id(Some("dup-machine-id\n"), Some("account-id"), &taken),
+            "dup-machine-id",
+            "既有目录机器码不得被改写"
+        );
+        // 目录缺失时才用账号值;未被占用则复用
+        assert_eq!(
+            choose_dir_machine_id(None, Some("account-id"), &taken),
+            "account-id"
+        );
+        // 目录缺失且账号值被占用 -> 生成合法新 UUID
+        let generated = choose_dir_machine_id(None, Some("dup-machine-id"), &taken);
+        assert!(
+            uuid::Uuid::parse_str(&generated).is_ok(),
+            "应生成合法 UUID: {generated}"
+        );
+        assert_ne!(generated, "dup-machine-id");
+    }
+
+    /// 已存在的 telemetry.machineId / devDeviceId 必须原样保留
+    #[test]
+    fn telemetry_ids_are_preserved_when_present() {
+        assert_eq!(
+            choose_telemetry_machine_id(Some("existing-machine"), "other-machine"),
+            "existing-machine"
+        );
+        assert_eq!(choose_dev_device_id(Some("existing-device")), "existing-device");
+    }
+
+    /// 缺失时才生成:machineId 由 machineid 派生,devDeviceId 为合法 UUID
+    #[test]
+    fn telemetry_ids_generate_when_missing() {
+        let machine = choose_telemetry_machine_id(None, "machine-1");
+        assert!(!machine.is_empty(), "machineId 不得为空");
+        assert_eq!(machine, telemetry_machine_id("machine-1"));
+
+        let device = choose_dev_device_id(None);
+        assert!(
+            uuid::Uuid::parse_str(&device).is_ok(),
+            "devDeviceId 应为合法 UUID: {device}"
+        );
+        let blank = choose_dev_device_id(Some("   "));
+        assert!(
+            uuid::Uuid::parse_str(&blank).is_ok(),
+            "空白值按缺失处理: {blank}"
+        );
     }
 
     /// 测试本地写入 iCubeAuthInfo + telemetry.devDeviceId 到目录(生产代码不回写实例目录)

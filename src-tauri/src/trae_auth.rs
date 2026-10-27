@@ -380,23 +380,6 @@ pub fn read_auth_from_data_dir_loose(
     })
 }
 
-/// 读取主目录实例的 telemetry.devDeviceId(用于识别工具目录是否被污染为与主目录共用设备)。
-/// 设备 id 非敏感,仅做对照。失败返回 None。
-pub fn read_main_telemetry_device_id() -> Option<String> {
-    let data_dir = crate::trae_machine::resolve_main_data_dir().ok()?;
-    let storage_path = data_dir
-        .join("User")
-        .join("globalStorage")
-        .join("storage.json");
-    let raw = fs::read_to_string(&storage_path).ok()?;
-    let storage: Value = serde_json::from_str(&raw).ok()?;
-    storage
-        .get("telemetry.devDeviceId")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-}
-
 /// 读取主目录实例当前登录的 userId(读主目录 storage.json 解密 iCubeAuthInfo)。
 /// 仅用于判断主实例登录账号:失败返回 None(主实例未登录/异常时不阻断状态判定)。
 pub fn read_main_instance_user_id() -> Option<String> {
