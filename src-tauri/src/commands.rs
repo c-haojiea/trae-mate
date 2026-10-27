@@ -599,17 +599,14 @@ pub fn launch_account_by_id(app: &AppHandle, account_id: &str) -> AppResult<Laun
     // 已有可用绑定目录时一律用绑定目录启动(含主账号),保证聊天记录/登录态落在同一目录
     let use_bound_dir = bound_dir_usable(&account);
 
-    // 防护:该账号已在主实例运行则拒绝启动(避免同账号双实例挤掉登录态、丢账号数据)
-    //        走绑定目录时该防护不成立:绑定目录与主目录本就是两个实例
+    // 防护:主目录正登录该账号时一律拒绝(无论有无绑定目录);双设备身份会让 refresh 被判定 token device not match
     let main = trae_machine::probe_main_instance();
-    if !use_bound_dir
-        && matches!(
-            trae_machine::account_state(&account, &main),
-            trae_machine::InstanceSource::Main
-        )
-    {
+    if matches!(
+        trae_machine::account_state(&account, &main),
+        trae_machine::InstanceSource::Main
+    ) {
         return Err(AppError::Launch(
-            "该账号已在主实例运行,请聚焦主实例而非重复启动".into(),
+            "主目录 Trae CN 正登录该账号,请先在主目录退出登录再启动,否则同账号双设备身份会导致令牌失效".into(),
         ));
     }
 
