@@ -76,6 +76,14 @@ pub(crate) fn try_begin(running: &Arc<AtomicBool>) -> Option<BatchGuard> {
     }
 }
 
+/// 批次开始:先抢互斥位,抢到后清除上一轮 stop 遗留的取消标志;
+/// 抢不到(已有批次在跑)时不得清除,否则会吞掉正在进行的 stop 请求。
+pub(crate) fn begin_batch(running: &Arc<AtomicBool>, cancel: &AtomicBool) -> Option<BatchGuard> {
+    let guard = try_begin(running)?;
+    cancel.store(false, Ordering::SeqCst);
+    Some(guard)
+}
+
 /// 可中断等待:每 250ms 检查取消标志,被取消返回 false。
 pub async fn sleep_interruptible(cancel: &AtomicBool, total: Duration) -> bool {
     let mut remaining = total;
@@ -633,7 +641,7 @@ pub async fn perform_all_checkin(
     let scheduler = app.state::<crate::scheduler::SchedulerState>();
     let running = scheduler.inner().running.clone();
     let cancel = scheduler.inner().cancel.clone();
-    let _guard = match try_begin(&running) {
+    let _guard = match begin_batch(&running, &cancel) {
         Some(g) => g,
         None => return Err("已有签到批次正在执行,请等待完成".into()),
     };
@@ -894,6 +902,23 @@ mod tests {
         drop(guard);
         assert!(!running.load(Ordering::SeqCst), "守卫 Drop 后释放");
         assert!(try_begin(&running).is_some(), "释放后可再次占用");
+    }
+
+    /// 批次入口:抢到互斥位后清除遗留 cancel;抢不到时不得清除(不能吞掉进行中的 stop)
+    #[test]
+    fn begin_batch_clears_stale_cancel() {
+        let running = Arc::new(AtomicBool::new(false));
+        let cancel = AtomicBool::new(true); // 上一轮 stop 遗留
+        let guard = begin_batch(&running, &cancel).expect("首次应获取成功");
+        assert!(!cancel.load(Ordering::SeqCst), "抢到互斥位后应清除遗留取消标志");
+
+        // 守卫未释放:重入失败,且不得把 cancel 清回 false
+        cancel.store(true, Ordering::SeqCst);
+        assert!(begin_batch(&running, &cancel).is_none(), "占用中不得重入");
+        assert!(cancel.load(Ordering::SeqCst), "重入失败时不得清除 cancel");
+
+        drop(guard);
+        assert!(!running.load(Ordering::SeqCst), "守卫 Drop 后释放");
     }
 }
 

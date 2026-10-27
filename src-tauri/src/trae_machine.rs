@@ -267,7 +267,46 @@ pub fn open_product_with_data_dir(
 
 // ===== 运行检测 =====
 
-/// 检查 data-dir 对应的实例是否在运行(读 code.lock 拿 PID + tasklist 验活)
+/// TRAE 实例进程镜像名白名单(小写精确匹配)。明确排除 TraeMate.exe:
+/// 绝不能把工具自身当成 TRAE 实例。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn allowed_instance_image(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "trae cn.exe" | "trae solo cn.exe" | "trae.exe" | "trae work cn.exe"
+    )
+}
+
+/// 解析 tasklist CSV 行:首字段为镜像名、次字段为 PID;镜像名合法且 PID 相符才算命中。
+/// 中英文 tasklist 的提示行(如「信息: 没有运行。」)没有字段结构,自然不匹配。
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn tasklist_line_matches(line: &str, pid: u32) -> bool {
+    let fields: Vec<&str> = line.split(',').map(|f| f.trim().trim_matches('"')).collect();
+    if fields.len() < 2 {
+        return false;
+    }
+    match fields[1].parse::<u32>() {
+        Ok(field_pid) => field_pid == pid && allowed_instance_image(fields[0]),
+        Err(_) => false,
+    }
+}
+
+/// 用 tasklist 确认该 PID 当前确实是 TRAE 实例。检测与关闭必须共用此判断,
+/// 避免 PID 复用把无关进程误认成实例、或被 taskkill 误杀。
+#[cfg(target_os = "windows")]
+fn tasklist_confirms_pid(pid: u32) -> bool {
+    let output = hide_window(Command::new("tasklist"))
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output();
+    match output {
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| tasklist_line_matches(line, pid)),
+        Err(_) => false,
+    }
+}
+
+/// 检查 data-dir 对应的实例是否在运行(读 code.lock 拿 PID + tasklist 校验进程身份)
 pub fn is_instance_running(data_dir: &str) -> (bool, Option<u32>) {
     let lock_path = Path::new(data_dir).join("code.lock");
     if !lock_path.exists() {
@@ -283,19 +322,7 @@ pub fn is_instance_running(data_dir: &str) -> (bool, Option<u32>) {
     };
     #[cfg(target_os = "windows")]
     {
-        let output = hide_window(Command::new("tasklist"))
-            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-            .output();
-        if let Ok(out) = output {
-            let text = String::from_utf8_lossy(&out.stdout);
-            // tasklist 输出含 PID 则存活;中文/英文环境都要排除"无任务"提示
-            let running = text.contains(&pid.to_string())
-                && !text.contains("没有运行")
-                && !text.contains("No tasks")
-                && !text.contains("信息: 没有运行");
-            return (running, Some(pid));
-        }
-        (false, Some(pid))
+        return (tasklist_confirms_pid(pid), Some(pid));
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -477,6 +504,10 @@ pub fn kill_instance(data_dir: &str) -> AppResult<()> {
         .trim()
         .parse()
         .map_err(|_| AppError::Launch("code.lock 的 PID 无效".into()))?;
+    // 进程身份校验:PID 可能被系统复用,只有确认是 TRAE 实例才允许结束进程树
+    if !tasklist_confirms_pid(pid) {
+        return Ok(()); // 镜像名不符或已退出,视为残留 lock,不执行 taskkill
+    }
     let _ = hide_window(Command::new("taskkill"))
         .args(["/PID", &pid.to_string(), "/F", "/T"])
         .output();
@@ -561,5 +592,47 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 镜像名白名单:大小写不敏感命中 TRAE 系列,排除 TraeMate 与无关进程
+    #[test]
+    fn image_name_whitelist_rejects_others() {
+        assert!(allowed_instance_image("Trae CN.exe"));
+        assert!(allowed_instance_image("TRAE SOLO CN.EXE"));
+        assert!(allowed_instance_image("Trae.exe"));
+        assert!(!allowed_instance_image("TraeMate.exe"), "不得把工具自身当成实例");
+        assert!(!allowed_instance_image("notepad.exe"));
+        assert!(!allowed_instance_image("Trae Helper.exe"));
+    }
+
+    /// tasklist CSV 行解析:镜像名合法且 PID 相符才命中,提示文本自然不匹配
+    #[test]
+    fn tasklist_line_matches_checks_pid_and_image() {
+        // 英文输出
+        assert!(tasklist_line_matches(
+            "\"Trae CN.exe\",\"1234\",\"Console\",\"1\",\"1,234 K\"",
+            1234
+        ));
+        assert!(!tasklist_line_matches(
+            "\"notepad.exe\",\"1234\",\"Console\",\"1\",\"1,234 K\"",
+            1234
+        ));
+        assert!(!tasklist_line_matches(
+            "\"Trae CN.exe\",\"1234\",\"Console\",\"1\",\"1,234 K\"",
+            9999
+        ));
+        // 中文输出
+        assert!(tasklist_line_matches(
+            "\"TRAE SOLO CN.exe\",\"5678\",\"Console\",\"1\",\"2,048 K\"",
+            5678
+        ));
+        assert!(!tasklist_line_matches(
+            "\"TraeMate.exe\",\"5678\",\"Console\",\"1\",\"2,048 K\"",
+            5678
+        ));
+        // 无 PID 的提示文本
+        assert!(!tasklist_line_matches("信息: 没有运行", 1234));
+        assert!(!tasklist_line_matches("信息: 没有运行。", 1234));
+        assert!(!tasklist_line_matches("INFO: No tasks are running", 1234));
     }
 }
