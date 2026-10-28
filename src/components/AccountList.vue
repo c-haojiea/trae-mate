@@ -117,8 +117,6 @@ function handleEdit(id: string, newName?: string) {
   align-items: center;
   gap: 14px;
   box-shadow: var(--shadow-soft-raised);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
   transition: box-shadow var(--t-smooth), transform var(--t-smooth), border-color var(--t-smooth);
 }
 

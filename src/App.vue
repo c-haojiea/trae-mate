@@ -308,7 +308,6 @@ onMounted(() => {
   position: absolute;
   border-radius: 50%;
   opacity: 0.85;
-  will-change: transform;
 }
 
 .blob-a {
@@ -317,7 +316,6 @@ onMounted(() => {
   left: -10vw;
   top: -18vw;
   background: radial-gradient(closest-side, var(--aurora-1), transparent 72%);
-  animation: drift-a 34s ease-in-out infinite alternate;
 }
 
 .blob-b {
@@ -326,7 +324,6 @@ onMounted(() => {
   right: -8vw;
   top: -6vw;
   background: radial-gradient(closest-side, var(--aurora-2), transparent 72%);
-  animation: drift-b 42s ease-in-out infinite alternate;
 }
 
 .blob-c {
@@ -335,22 +332,6 @@ onMounted(() => {
   left: 24vw;
   bottom: -24vw;
   background: radial-gradient(closest-side, var(--aurora-3), transparent 70%);
-  animation: drift-c 50s ease-in-out infinite alternate;
-}
-
-@keyframes drift-a {
-  from { transform: translate3d(0, 0, 0) scale(1); }
-  to { transform: translate3d(4vw, 3vw, 0) scale(1.08); }
-}
-
-@keyframes drift-b {
-  from { transform: translate3d(0, 0, 0) scale(1); }
-  to { transform: translate3d(-5vw, 4vw, 0) scale(0.95); }
-}
-
-@keyframes drift-c {
-  from { transform: translate3d(0, 0, 0) scale(1); }
-  to { transform: translate3d(-4vw, -3vw, 0) scale(1.06); }
 }
 
 .app-body {
@@ -371,8 +352,6 @@ onMounted(() => {
   font-size: 13px;
   font-weight: 600;
   text-align: center;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
 }
 
 /* ===== 侧边栏 ===== */
@@ -388,8 +367,6 @@ onMounted(() => {
   background: var(--glass-bg);
   border: 1px solid var(--glass-border);
   box-shadow: var(--shadow-md-raised);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
   overflow: hidden;
 }
 
@@ -635,8 +612,6 @@ onMounted(() => {
   border: 1px solid var(--glass-border);
   border-radius: var(--r-lg);
   box-shadow: var(--shadow-soft-raised);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
 }
 
 .top-bar-left {
@@ -685,8 +660,6 @@ onMounted(() => {
   border-radius: var(--r-pill);
   background: var(--glass-bg-strong);
   border: 1px solid var(--glass-border);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
   font-weight: 600;
   font-size: 13px;
   box-shadow: var(--shadow-md-raised);

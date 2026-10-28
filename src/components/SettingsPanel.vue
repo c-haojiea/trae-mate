@@ -574,8 +574,6 @@ function formatJson(obj?: Record<string, any>): string {
   border: 1px solid var(--glass-border);
   border-radius: var(--r-lg);
   box-shadow: var(--shadow-soft-raised);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
 }
 
 .section-title {

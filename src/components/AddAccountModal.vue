@@ -357,8 +357,6 @@ function expireText(ms: number): string {
   display: flex;
   flex-direction: column;
   box-shadow: var(--shadow-bold-raised);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
   overflow: hidden;
 }
 

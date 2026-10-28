@@ -157,8 +157,6 @@ onMounted(() => {
   border: 1px solid var(--glass-border);
   border-radius: var(--r-md);
   box-shadow: var(--shadow-soft-inset);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
 }
 
 .filter-tab {

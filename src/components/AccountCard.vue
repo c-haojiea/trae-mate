@@ -372,8 +372,6 @@ function formatDateTime(timestamp: number): string {
   border: 1px solid var(--glass-border);
   border-radius: var(--r-lg);
   box-shadow: var(--shadow-soft-raised);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
 }
 
 .account-card:hover {
@@ -586,8 +584,6 @@ function formatDateTime(timestamp: number): string {
   background: var(--glass-bg-strong);
   border: 1px solid var(--glass-border);
   box-shadow: var(--shadow-bold-raised);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
 }
 
 .edit-dialog h3 {

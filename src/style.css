@@ -15,7 +15,7 @@
   --surface-deep: rgba(238, 243, 250, 0.52);
   --surface-raised: rgba(255, 255, 255, 0.78);
 
-  --glass-bg: rgba(255, 255, 255, 0.56);
+  --glass-bg: rgba(255, 255, 255, 0.74);
   --glass-bg-strong: rgba(255, 255, 255, 0.74);
   --glass-border: rgba(255, 255, 255, 0.72);
   --glass-border-strong: rgba(255, 255, 255, 0.95);
@@ -198,8 +198,6 @@ h1, h2, h3, h4 {
   border: 1px solid var(--glass-border);
   border-radius: var(--r-lg);
   box-shadow: var(--shadow-soft-raised);
-  backdrop-filter: var(--glass-blur);
-  -webkit-backdrop-filter: var(--glass-blur);
 }
 
 /* 按钮 - 玻璃凸起 -> 按下微缩 */
