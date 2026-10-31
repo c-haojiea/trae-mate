@@ -44,6 +44,12 @@ pub struct Account {
     /// 多开实例的机器码(每实例独立 UUID,不动系统注册表)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub machine_id: Option<String>,
+    /// access token 到期时间(毫秒时间戳,随凭据持久化,供列表直接展示)
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    /// refresh token 到期时间(毫秒时间戳)
+    #[serde(default)]
+    pub refresh_expires_at: Option<i64>,
     // ===== 参考模式新增字段(jwt 账号 / 展示态,全部 default 保证旧数据兼容) =====
     #[serde(default)]
     pub source: AccountSource,
@@ -95,6 +101,8 @@ pub struct PublicAccount {
     pub credential_status: Option<String>,
     pub data_dir: Option<String>,
     pub machine_id: Option<String>,
+    pub expires_at: Option<i64>,
+    pub refresh_expires_at: Option<i64>,
     pub source: AccountSource,
     pub user_id: Option<String>,
     pub jwt_exp_timestamp: Option<i64>,
@@ -126,6 +134,8 @@ impl From<Account> for PublicAccount {
             credential_status: a.credential_status,
             data_dir: a.data_dir,
             machine_id: a.machine_id,
+            expires_at: a.expires_at,
+            refresh_expires_at: a.refresh_expires_at,
             source: a.source,
             user_id: a.user_id,
             jwt_exp_timestamp: a.jwt_exp_timestamp,

@@ -17,6 +17,9 @@ export interface Account {
   credentialStatus?: 'valid' | 'expiring' | 'expired'
   dataDir?: string
   machineId?: string
+  // 令牌到期时间(毫秒时间戳),随凭据持久化,旧账号回读前为 undefined
+  expiresAt?: number
+  refreshExpiresAt?: number
   // 参考模式新增
   source?: 'desktop' | 'jwt'
   userId?: string
@@ -434,7 +437,8 @@ export const useAppStore = defineStore('app', () => {
         fetchAccounts(),
         fetchLogs(),
         fetchSettings(),
-        fetchNextRunTime()
+        fetchNextRunTime(),
+        fetchCreditsDaily()
       ])
       // 一键签到实时进度事件
       await listen<CheckinProgressEvent>('checkin-start', (e) => {

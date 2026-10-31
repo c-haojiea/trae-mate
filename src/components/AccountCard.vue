@@ -31,8 +31,8 @@
         </span>
       </div>
       <div class="info-row">
-        <span class="info-label">添加时间</span>
-        <span class="info-value">{{ formatDate(account.createdAt) }}</span>
+        <span class="info-label">录入</span>
+        <span class="info-value">{{ formatDate(account.createdAt) }}（第 {{ entryDay }} 天）</span>
       </div>
       <div class="info-row" v-if="account.source !== 'jwt' && account.credentialStatus">
         <span class="info-label">桌面凭证</span>
@@ -49,6 +49,10 @@
             <Icon name="arrow-path" :size="11" :class="{ spinning: refreshingCred }" />
           </button>
         </span>
+      </div>
+      <div class="info-row" v-if="account.expiresAt">
+        <span class="info-label">令牌到期</span>
+        <span class="info-value" :class="tokenExpireClass">{{ tokenExpireText }}</span>
       </div>
       <div class="info-row" v-if="isJwt">
         <span class="info-label">JWT 状态</span>
@@ -349,6 +353,34 @@ function formatDate(timestamp: number): string {
   const date = new Date(timestamp)
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
+
+function formatDateTimeFull(timestamp: number): string {
+  const date = new Date(timestamp)
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+}
+
+// 录入第 N 天:录入当天算第 1 天
+const entryDay = computed(() => Math.floor((Date.now() - props.account.createdAt) / 86400000) + 1)
+
+// 令牌到期:>7 天正常色、3-7 天橙色、<3 天或已过期红色
+const tokenExpireText = computed(() => {
+  const exp = props.account.expiresAt
+  if (!exp) return ''
+  const left = exp - Date.now()
+  if (left <= 0) return `${formatDateTimeFull(exp)} 已过期`
+  const days = Math.floor(left / 86400000)
+  return `${formatDateTimeFull(exp)} 剩余 ${days} 天`
+})
+
+const tokenExpireClass = computed(() => {
+  const exp = props.account.expiresAt
+  if (!exp) return ''
+  const left = exp - Date.now()
+  const days = Math.floor(left / 86400000)
+  if (left <= 0 || days < 3) return 'text-danger'
+  if (days < 7) return 'text-warning'
+  return ''
+})
 
 function formatDateTime(timestamp: number): string {
   const date = new Date(timestamp)

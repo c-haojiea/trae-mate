@@ -139,6 +139,9 @@
         正在等待新实例登录,登录后将自动导入账号…
       </div>
 
+      <!-- 积分看板(默认折叠,点标题展开) -->
+      <CreditsBoard />
+
       <!-- 内容区域 -->
       <div class="content-area">
         <AccountList v-if="activeTab === 'accounts'" @add-account="showAddModal = true" @notify="showToast" />
@@ -166,6 +169,7 @@ import AccountList from './components/AccountList.vue'
 import CheckinLog from './components/CheckinLog.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import AddAccountModal from './components/AddAccountModal.vue'
+import CreditsBoard from './components/CreditsBoard.vue'
 import Icon from './components/Icon.vue'
 
 const appWindow = getCurrentWindow()
@@ -254,6 +258,7 @@ async function handleRefresh() {
   refreshing.value = true
   try {
     void store.fetchAccounts()
+    void store.fetchCreditsDaily()
     store.refreshInstances()
   } catch (e) {
     console.error('刷新失败:', e)

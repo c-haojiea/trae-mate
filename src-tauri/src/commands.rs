@@ -457,7 +457,10 @@ pub async fn refresh_all_remaining_credits(
 pub fn credits_daily_list(
     state: State<'_, AppState>,
 ) -> Vec<crate::models::CreditsDailySnapshot> {
-    crate::fs_utils::read_json(&state.data_path("credits_daily.json"))
+    // 文件根是 {"snapshots": [...]},需按 CreditsDailyFile 反序列化后再取快照列表
+    let file: crate::models::CreditsDailyFile =
+        crate::fs_utils::read_json(&state.data_path("credits_daily.json"));
+    file.snapshots
 }
 
 /// 用系统默认浏览器打开外部链接(关于页"项目地址"用)
@@ -1096,6 +1099,8 @@ pub fn import_account_from_dir(
                     "credentialStatus": status,
                     "dataDir": data_dir,
                     "machineId": machine_id,
+                    "expiresAt": cred.expires_at,
+                    "refreshExpiresAt": cred.refresh_expires_at,
                 }),
             )
             .ok_or_else(|| AppError::NotFound(acc.id.clone()))?,
@@ -1115,6 +1120,8 @@ pub fn import_account_from_dir(
                 credential_status: Some(status.to_string()),
                 data_dir: Some(data_dir.clone()),
                 machine_id,
+                expires_at: Some(cred.expires_at),
+                refresh_expires_at: Some(cred.refresh_expires_at),
                 source: AccountSource::Desktop,
                 ..Default::default()
             };

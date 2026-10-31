@@ -281,7 +281,12 @@ fn persist_credential(state: &AppState, account: &Account, cred: &Credential) {
     let mut data = state.data.lock().unwrap();
     data.update_account(
         &account.id,
-        json!({ "encryptedCredential": new_encrypted, "credentialStatus": status }),
+        json!({
+            "encryptedCredential": new_encrypted,
+            "credentialStatus": status,
+            "expiresAt": cred.expires_at,
+            "refreshExpiresAt": cred.refresh_expires_at,
+        }),
     );
     let _ = data.save(&state.path);
 }
