@@ -118,7 +118,7 @@ fn credits_history_path(state: &crate::store::AppState) -> PathBuf {
     state.data_path("credits_history.json")
 }
 
-/// 把账号最新积分与本次新增写入 credits_history.json(按日期追加,裁剪到 90 天内)。
+/// 把账号最新积分与本次新增写入 credits_history.json(按日期追加,永久保留)。
 pub fn save_credits_history(
     state: &crate::store::AppState,
     user_id: &str,
@@ -134,10 +134,7 @@ pub fn save_credits_history(
         credits,
         delta,
     });
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(90))
-        .format("%Y-%m-%d")
-        .to_string();
-    file.records.retain(|r| r.date >= cutoff);
+    // 不再按 90 天裁剪:每天 1 条约 60B,10 年不足 250KB
     let _ = fs_utils::write_json(&path, &file);
 }
 
@@ -178,8 +175,41 @@ pub fn remove_account_data(state: &crate::store::AppState, user_id: &str) {
     }
 }
 
+/// 按账号求和算消耗:仅当昨日快照也带 per_account 时启用新算法。
+/// 返回 (consumed, consumed_legacy)。
+/// 规则:consumed = Σ max(0, 昨日余额 + 今日该号 earned − 今日余额),只看昨日已存在的 uid;
+/// 只出现在今日的 uid(新号入库)计 0 消耗;昨日/今日任一缺失的 uid 跳过。
+fn compute_consumed(
+    prev: Option<&CreditsDailySnapshot>,
+    today: &std::collections::BTreeMap<String, f64>,
+    earned_by_uid: &std::collections::HashMap<String, f64>,
+    merged_total: f64,
+    merged_earned: f64,
+) -> (f64, bool) {
+    let prev_total = prev.map(|p| p.total).unwrap_or(0.0);
+    if let Some(prev_map) = prev.and_then(|p| p.per_account.as_ref()) {
+        if !prev_map.is_empty() {
+            let mut consumed = 0.0f64;
+            for (uid, prev_i) in prev_map {
+                let Some(today_i) = today.get(uid) else {
+                    continue;
+                };
+                let earned_i = earned_by_uid.get(uid).copied().unwrap_or(0.0);
+                consumed += (prev_i + earned_i - today_i).max(0.0);
+            }
+            return (round2(consumed), false);
+        }
+    }
+    // 昨日无个体余额(历史数据):退回旧公式,并标记该条由旧算法得出
+    (
+        round2((merged_total - merged_earned - prev_total).abs()),
+        true,
+    )
+}
+
 /// 记录每日积分快照(每天计算一次):total=所有账号剩余积分之和;
-/// earned=今日签到获得(delta 之和)+ 购买获得;consumed=|total-earned-昨日total|。
+/// earned=今日签到获得(delta 之和)+ 购买获得;
+/// consumed 优先按账号求和(见 compute_consumed),昨日缺 per_account 时退回旧公式并标 legacy。
 pub fn record_daily_snapshot(
     state: &crate::store::AppState,
     rc: &RemainingCreditsFile,
@@ -191,40 +221,45 @@ pub fn record_daily_snapshot(
     let mut file: CreditsDailyFile = fs_utils::read_json(&state.data_path("credits_daily.json"));
 
     let credits_file: CreditsFile = fs_utils::read_json(&credits_history_path(state));
-    let checkin_earned: f64 = credits_file
-        .records
-        .iter()
-        .filter(|r| r.date == today && r.user_id != "_daily_total")
-        .map(|r| r.delta as f64)
-        .sum();
+    let mut checkin_earned = 0.0;
+    let mut earned_by_uid: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for r in &credits_file.records {
+        if r.date != today || r.user_id == "_daily_total" {
+            continue;
+        }
+        let delta = r.delta as f64;
+        checkin_earned += delta;
+        *earned_by_uid.entry(r.user_id.clone()).or_insert(0.0) += delta;
+    }
     let earned = round2(checkin_earned + non_checkin_earned);
 
-    let yesterday_total = file
+    let today_map: std::collections::BTreeMap<String, f64> =
+        rc.credits.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let prev = file
         .snapshots
         .iter()
         .filter(|s| s.date < today)
         .last()
-        .map(|s| s.total)
-        .unwrap_or(0.0);
-    let consumed = round2((total - earned - yesterday_total).abs());
+        .cloned();
+    let (consumed, legacy) =
+        compute_consumed(prev.as_ref(), &today_map, &earned_by_uid, total, earned);
 
+    let snap = CreditsDailySnapshot {
+        date: today.clone(),
+        total,
+        earned,
+        consumed,
+        per_account: Some(today_map),
+        consumed_legacy: legacy,
+    };
     if let Some(existing) = file.snapshots.iter_mut().find(|s| s.date == today) {
-        existing.total = total;
-        existing.earned = earned;
-        existing.consumed = consumed;
+        // 同日重复刷新:整条重写(earned 由当日历史重新求和,不累加)
+        *existing = snap;
     } else {
-        file.snapshots.push(CreditsDailySnapshot {
-            date: today,
-            total,
-            earned,
-            consumed,
-        });
+        file.snapshots.push(snap);
     }
 
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(90))
-        .format("%Y-%m-%d")
-        .to_string();
-    file.snapshots.retain(|s| s.date >= cutoff);
+    // 不再按 90 天裁剪(永久保留)
     let _ = fs_utils::write_json(&state.data_path("credits_daily.json"), &file);
 }
 
@@ -312,4 +347,56 @@ pub async fn refresh_remaining_credits(
         );
     }
     Ok(ok_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, HashMap};
+
+    fn balances(items: &[(&str, f64)]) -> BTreeMap<String, f64> {
+        items.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    /// 两日均有 per_account:一个号降 2000(签到 900 后再消耗)、一个新号入库 2700
+    /// 新算法 = 2000;旧净值公式 = 700(5100 与 2700 相互抵消)
+    #[test]
+    fn consumed_sums_per_account_drops() {
+        let prev = CreditsDailySnapshot {
+            date: "2026-10-30".into(),
+            total: 5000.0,
+            earned: 0.0,
+            consumed: 0.0,
+            per_account: Some(balances(&[("a", 5000.0)])),
+            consumed_legacy: false,
+        };
+        let today = balances(&[("a", 3900.0), ("b", 2700.0)]);
+        let earned_by_uid: HashMap<String, f64> = [("a".to_string(), 900.0)].into_iter().collect();
+
+        let (consumed, legacy) = compute_consumed(Some(&prev), &today, &earned_by_uid, 6600.0, 900.0);
+        assert_eq!(consumed, 2000.0);
+        assert!(!legacy);
+
+        // 旧公式(净值绝对值)只有 700,新算法必须区分出个体消耗
+        assert_eq!(round2((6600.0 - 900.0 - 5000.0_f64).abs()), 700.0);
+    }
+
+    /// 昨日缺 per_account(历史数据):退回旧公式,并标记 consumed_legacy = true
+    #[test]
+    fn consumed_falls_back_to_legacy_when_yesterday_lacks_per_account() {
+        let prev = CreditsDailySnapshot {
+            date: "2026-10-30".into(),
+            total: 5000.0,
+            earned: 0.0,
+            consumed: 0.0,
+            per_account: None,
+            consumed_legacy: false,
+        };
+        let today = balances(&[("a", 3900.0), ("b", 2700.0)]);
+
+        let (consumed, legacy) =
+            compute_consumed(Some(&prev), &today, &HashMap::new(), 6600.0, 900.0);
+        assert_eq!(consumed, 700.0);
+        assert!(legacy);
+    }
 }

@@ -80,6 +80,10 @@ export interface CreditsDailySnapshot {
   total: number
   earned: number
   consumed: number
+  /** 当日各账号余额(uid -> 余额);旧数据无此字段(=旧算法) */
+  per_account?: Record<string, number> | null
+  /** 该条 consumed 是否由旧算法(净值绝对值)得出 */
+  consumed_legacy?: boolean
 }
 
 export interface JwtPreview {
@@ -434,6 +438,11 @@ export const useAppStore = defineStore('app', () => {
     return result
   }
 
+  // 导出 CSV(日汇总 + 明细),返回两个文件绝对路径
+  async function exportCreditsCsv() {
+    return invoke<string[]>('credits_export_csv')
+  }
+
   // 初始化
   async function init() {
     loading.value = true
@@ -516,6 +525,7 @@ export const useAppStore = defineStore('app', () => {
     fetchRemainingCredits,
     refreshAllCredits,
     fetchCreditsDaily,
+    exportCreditsCsv,
     init
   }
 })

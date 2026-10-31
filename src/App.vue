@@ -140,7 +140,7 @@
       </div>
 
       <!-- 积分看板(默认折叠,点标题展开) -->
-      <CreditsBoard />
+      <CreditsBoard @notify="showToast" />
 
       <!-- 内容区域 -->
       <div class="content-area">

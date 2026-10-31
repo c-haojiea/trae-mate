@@ -14,6 +14,14 @@
       </span>
       <button
         class="cb-refresh"
+        :disabled="exporting"
+        title="导出积分日汇总与账号明细 CSV"
+        @click.stop="handleExport"
+      >
+        {{ exporting ? '导出中…' : '导出 CSV' }}
+      </button>
+      <button
+        class="cb-refresh"
         :disabled="refreshing"
         title="刷新所有账号剩余积分"
         @click.stop="handleRefresh"
@@ -33,7 +41,14 @@
       <div class="cb-today">
         <div class="cb-stat">
           <span class="cb-stat-label">今日消耗</span>
-          <span class="cb-stat-value">{{ todaySnap ? fmt(todaySnap.consumed) : '—' }}</span>
+          <span class="cb-stat-value">
+            {{ todaySnap ? fmt(todaySnap.consumed) : '—' }}
+            <span
+              v-if="todaySnap && todaySnap.consumed_legacy"
+              class="cb-legacy"
+              title="该条由旧算法得出：consumed=|今日总额−新增−昨日总额| 取净值绝对值，会把新号入库/签到与消耗互相抵消，不代表真实消耗"
+            >（旧算法·净值）</span>
+          </span>
         </div>
         <div class="cb-stat">
           <span class="cb-stat-label">今日新增</span>
@@ -45,6 +60,9 @@
         </div>
       </div>
       <p v-if="!todaySnap" class="cb-hint">今日尚未刷新积分</p>
+      <p v-if="exportPaths.length" class="cb-export-paths">
+        已导出：<br />{{ exportPaths[0] }}<br />{{ exportPaths[1] }}
+      </p>
 
       <!-- 近 N 天 -->
       <div class="cb-section">
@@ -107,8 +125,11 @@ import { computed, ref } from 'vue'
 import { useAppStore } from '../stores/app'
 
 const store = useAppStore()
+const emit = defineEmits<{ (e: 'notify', message: string, type?: 'success' | 'error'): void }>()
 const expanded = ref(false)
 const refreshing = ref(false)
+const exporting = ref(false)
+const exportPaths = ref<string[]>([])
 
 // 时间范围档位:7 / 30 / 全部(90)
 const range = ref(7)
@@ -172,6 +193,20 @@ async function handleRefresh() {
     await Promise.all([store.fetchCreditsDaily(), store.fetchAccounts()])
   } finally {
     refreshing.value = false
+  }
+}
+
+async function handleExport() {
+  if (exporting.value) return
+  exporting.value = true
+  try {
+    const paths = await store.exportCreditsCsv()
+    exportPaths.value = paths
+    emit('notify', 'CSV 已导出到 data\\exports', 'success')
+  } catch (e: any) {
+    emit('notify', '导出失败: ' + (e?.message || e), 'error')
+  } finally {
+    exporting.value = false
   }
 }
 
@@ -300,6 +335,20 @@ function fmt(n: number): string {
   font-size: 12px;
   color: var(--text-muted);
   margin: 6px 0 0;
+}
+
+.cb-legacy {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--warning);
+}
+
+.cb-export-paths {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin: 6px 0 0;
+  line-height: 1.5;
+  word-break: break-all;
 }
 
 .cb-section {

@@ -421,6 +421,12 @@ pub struct CreditsDailySnapshot {
     pub total: f64,
     pub earned: f64,
     pub consumed: f64,
+    /// 当日各账号余额快照(uid -> 余额);旧数据无此字段,按账号算消耗时缺失即按旧算法
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_account: Option<std::collections::BTreeMap<String, f64>>,
+    /// 该条 consumed 是否由旧算法(净值绝对值)得出
+    #[serde(default)]
+    pub consumed_legacy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

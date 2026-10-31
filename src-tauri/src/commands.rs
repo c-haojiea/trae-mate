@@ -492,6 +492,77 @@ pub fn credits_daily_list(state: State<'_, AppState>) -> serde_json::Value {
     })
 }
 
+/// 导出积分数据为 CSV(日汇总 + 每账号明细),UTF-8 无 BOM + CRLF,Excel 可直接打开。
+/// 返回两个文件的绝对路径(顺序:日汇总、明细)。
+#[tauri::command]
+pub fn credits_export_csv(state: State<'_, AppState>) -> AppResult<Vec<String>> {
+    let file: crate::models::CreditsDailyFile =
+        crate::fs_utils::read_json(&state.data_path("credits_daily.json"));
+    let export_dir = state.data_path("exports");
+    std::fs::create_dir_all(&export_dir)?;
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M").to_string();
+
+    let mut snaps = file.snapshots.clone();
+    snaps.sort_by(|a, b| a.date.cmp(&b.date));
+
+    let mut csv_daily = String::from("date,total,earned,consumed,legacy\r\n");
+    for s in &snaps {
+        // 旧数据(无 per_account)一律视为旧算法算出
+        let legacy = s.consumed_legacy || s.per_account.is_none();
+        csv_daily.push_str(&format!(
+            "{},{:.2},{:.2},{:.2},{}\r\n",
+            s.date,
+            s.total,
+            s.earned,
+            s.consumed,
+            if legacy { "true" } else { "false" }
+        ));
+    }
+    let daily_path = export_dir.join(format!("credits_daily_{stamp}.csv"));
+    std::fs::write(&daily_path, csv_daily.as_bytes())?;
+
+    // 账号名映射:remaining_credits 的 key 与 effective_user_id 一致
+    let names: std::collections::HashMap<String, String> = {
+        let data = state.data.lock().unwrap();
+        data.get_accounts()
+            .iter()
+            .filter_map(|a| effective_user_id(a).map(|uid| (uid.to_string(), a.name.clone())))
+            .collect()
+    };
+    let mut csv_detail = String::from("date,uid,name,credits\r\n");
+    for s in &snaps {
+        let Some(map) = &s.per_account else {
+            continue;
+        };
+        for (uid, credits) in map {
+            let name = names.get(uid).cloned().unwrap_or_default();
+            csv_detail.push_str(&format!(
+                "{},{},{},{:.2}\r\n",
+                s.date,
+                uid,
+                csv_field(&name),
+                credits
+            ));
+        }
+    }
+    let detail_path = export_dir.join(format!("credits_detail_{stamp}.csv"));
+    std::fs::write(&detail_path, csv_detail.as_bytes())?;
+
+    Ok(vec![
+        daily_path.to_string_lossy().to_string(),
+        detail_path.to_string_lossy().to_string(),
+    ])
+}
+
+/// CSV 字段转义(含逗号/引号/换行时加双引号,内部引号加倍)
+fn csv_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
 /// 用系统默认浏览器打开外部链接(关于页"项目地址"用)
 #[tauri::command]
 pub fn open_url(url: String) -> AppResult<()> {

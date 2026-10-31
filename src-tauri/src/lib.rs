@@ -283,6 +283,7 @@ pub fn run() {
             commands::fetch_remaining_credits,
             commands::refresh_all_remaining_credits,
             commands::credits_daily_list,
+            commands::credits_export_csv,
             commands::open_url,
         ])
         .run(tauri::generate_context!())
