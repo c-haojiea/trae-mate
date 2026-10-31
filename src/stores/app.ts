@@ -20,6 +20,8 @@ export interface Account {
   // 令牌到期时间(毫秒时间戳),随凭据持久化,旧账号回读前为 undefined
   expiresAt?: number
   refreshExpiresAt?: number
+  // 实例目录是否仍登录(true/false),未绑定目录或读失败为 null/undefined
+  instanceLoggedIn?: boolean | null
   // 参考模式新增
   source?: 'desktop' | 'jwt'
   userId?: string
@@ -145,6 +147,8 @@ export const useAppStore = defineStore('app', () => {
   const checkinProgress = ref<Record<string, CheckinProgressEvent>>({}) // 一键签到实时进度(按 user_id 索引)
   const checkinTotal = ref(0)
   const creditsDaily = ref<CreditsDailySnapshot[]>([])
+  // remaining_credits.json 的 updated_at(数据截至时间)
+  const creditsUpdatedAt = ref<string | null>(null)
 
   // 计算属性
   const enabledAccounts = computed(() => accounts.value.filter(a => a.enabled))
@@ -424,8 +428,9 @@ export const useAppStore = defineStore('app', () => {
 
   // 每日积分快照
   async function fetchCreditsDaily() {
-    const result = await invoke<CreditsDailySnapshot[]>('credits_daily_list')
-    creditsDaily.value = result || []
+    const result = await invoke<{ snapshots: CreditsDailySnapshot[]; dataUpdatedAt: string | null }>('credits_daily_list')
+    creditsDaily.value = result?.snapshots || []
+    creditsUpdatedAt.value = result?.dataUpdatedAt ?? null
     return result
   }
 
@@ -474,6 +479,7 @@ export const useAppStore = defineStore('app', () => {
     checkinProgress,
     checkinTotal,
     creditsDaily,
+    creditsUpdatedAt,
     // 计算属性
     enabledAccounts,
     todayCheckedCount,

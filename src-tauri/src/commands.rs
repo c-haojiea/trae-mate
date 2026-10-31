@@ -106,9 +106,35 @@ fn build_account_views(state: &AppState) -> Vec<PublicAccount> {
                     a.points = Some(c);
                 }
             }
-            a.into()
+            let dir = a.data_dir.clone();
+            let mut view: PublicAccount = a.into();
+            // 只读判断实例是否仍登着(不改任何 storage 内容)
+            view.instance_logged_in = instance_logged_in(dir.as_deref());
+            view
         })
         .collect()
+}
+
+/// 只读判断:实例目录的 storage.json 里 iCubeAuthInfo 是否存在且非空(即客户端仍登着)
+fn instance_logged_in(data_dir: Option<&str>) -> Option<bool> {
+    let dir = data_dir?;
+    let path = std::path::Path::new(dir)
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    // 实际键名为 iCubeAuthInfo://icube.cloudide(个别版本写作 cube.cloudide),两者都认
+    let ok = ["iCubeAuthInfo://icube.cloudide", "iCubeAuthInfo://cube.cloudide"]
+        .iter()
+        .any(|k| {
+            value
+                .get(*k)
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        });
+    Some(ok)
 }
 
 /// 导入当前 TRAE 桌面账号:读取桌面凭据 -> DPAPI 加密 -> upsert 存储
@@ -453,14 +479,17 @@ pub async fn refresh_all_remaining_credits(
 }
 
 /// 每日积分快照列表(积分看板三线趋势数据源)
+/// 同时返回 remaining_credits.json 的 updated_at,供前端显示「数据截至」
 #[tauri::command]
-pub fn credits_daily_list(
-    state: State<'_, AppState>,
-) -> Vec<crate::models::CreditsDailySnapshot> {
-    // 文件根是 {"snapshots": [...]},需按 CreditsDailyFile 反序列化后再取快照列表
+pub fn credits_daily_list(state: State<'_, AppState>) -> serde_json::Value {
     let file: crate::models::CreditsDailyFile =
         crate::fs_utils::read_json(&state.data_path("credits_daily.json"));
-    file.snapshots
+    let rc: crate::models::RemainingCreditsFile =
+        crate::fs_utils::read_json(&state.data_path("remaining_credits.json"));
+    serde_json::json!({
+        "snapshots": file.snapshots,
+        "dataUpdatedAt": rc.updated_at,
+    })
 }
 
 /// 用系统默认浏览器打开外部链接(关于页"项目地址"用)

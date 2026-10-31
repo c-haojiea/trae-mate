@@ -1,5 +1,5 @@
 <template>
-  <div class="account-card card" :class="{ disabled: !account.enabled }">
+  <div class="account-card card" :class="{ disabled: !account.enabled, 'instance-dead': instanceDead }">
     <!-- 卡片头部 -->
     <div class="card-header">
       <div class="account-info">
@@ -8,6 +8,7 @@
           <h3 class="account-name">
             {{ account.name }}
             <span v-if="instanceState.isMainAccount" class="badge-main">主账号</span>
+            <span v-if="instanceDead" class="badge-dead">实例未登录</span>
           </h3>
           <span class="badge" :class="statusBadgeClass">
             {{ statusText }}
@@ -50,7 +51,7 @@
           </button>
         </span>
       </div>
-      <div class="info-row" v-if="account.expiresAt">
+      <div class="info-row" v-if="account.expiresAt || instanceDead">
         <span class="info-label">令牌到期</span>
         <span class="info-value" :class="tokenExpireClass">{{ tokenExpireText }}</span>
       </div>
@@ -185,7 +186,10 @@ const statusText = computed(() => {
   const lastDate = new Date(props.account.lastCheckinAt).toDateString()
 
   if (lastDate === today) {
-    return props.account.lastCheckinResult === 'success' ? '今日已签' : '今日失败'
+    if (props.account.lastCheckinResult === 'success') {
+      return instanceDead.value ? '今日已签（已失效）' : '今日已签'
+    }
+    return '今日失败'
   }
   return '待签到'
 })
@@ -198,7 +202,10 @@ const statusBadgeClass = computed(() => {
   const lastDate = new Date(props.account.lastCheckinAt).toDateString()
 
   if (lastDate === today) {
-    return props.account.lastCheckinResult === 'success' ? 'badge-success' : 'badge-danger'
+    if (props.account.lastCheckinResult === 'success') {
+      return instanceDead.value ? 'badge-muted' : 'badge-success'
+    }
+    return 'badge-danger'
   }
   return 'badge-info'
 })
@@ -359,11 +366,16 @@ function formatDateTimeFull(timestamp: number): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
 }
 
+// 实例是否仍登录:仅 false 才标记,null/undefined 不动(避免误伤未绑定目录的账号)
+const instanceDead = computed(() => props.account.instanceLoggedIn === false)
+
 // 录入第 N 天:录入当天算第 1 天
 const entryDay = computed(() => Math.floor((Date.now() - props.account.createdAt) / 86400000) + 1)
 
 // 令牌到期:>7 天正常色、3-7 天橙色、<3 天或已过期红色
 const tokenExpireText = computed(() => {
+  // 实例未登录 = 该令牌已无法续期,直接提示重扫
+  if (instanceDead.value) return '令牌已失效，需重扫'
   const exp = props.account.expiresAt
   if (!exp) return ''
   const left = exp - Date.now()
@@ -373,6 +385,7 @@ const tokenExpireText = computed(() => {
 })
 
 const tokenExpireClass = computed(() => {
+  if (instanceDead.value) return 'text-danger'
   const exp = props.account.expiresAt
   if (!exp) return ''
   const left = exp - Date.now()
@@ -414,6 +427,24 @@ function formatDateTime(timestamp: number): string {
 
 .account-card.disabled {
   opacity: 0.55;
+}
+
+/* 实例未登录:整体置灰 + 左侧红条 */
+.account-card.instance-dead {
+  opacity: 0.62;
+  border-left: 3px solid var(--danger);
+}
+
+.badge-dead {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: var(--r-sm);
+  background: rgba(220, 38, 38, 0.16);
+  color: var(--danger);
+  font-size: 10px;
+  font-weight: 700;
+  vertical-align: middle;
 }
 
 .card-header {

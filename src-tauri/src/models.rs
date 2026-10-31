@@ -103,6 +103,8 @@ pub struct PublicAccount {
     pub machine_id: Option<String>,
     pub expires_at: Option<i64>,
     pub refresh_expires_at: Option<i64>,
+    /// 实例是否仍登录(storage.json 里 iCubeAuthInfo 存在且非空);目录缺失/读取失败为 None
+    pub instance_logged_in: Option<bool>,
     pub source: AccountSource,
     pub user_id: Option<String>,
     pub jwt_exp_timestamp: Option<i64>,
@@ -136,6 +138,7 @@ impl From<Account> for PublicAccount {
             machine_id: a.machine_id,
             expires_at: a.expires_at,
             refresh_expires_at: a.refresh_expires_at,
+            instance_logged_in: None,
             source: a.source,
             user_id: a.user_id,
             jwt_exp_timestamp: a.jwt_exp_timestamp,

@@ -12,10 +12,24 @@
       <span class="cb-summary">
         {{ todaySnap ? `今日消耗 ${fmt(todaySnap.consumed)} · 新增 ${fmt(todaySnap.earned)}` : '今日尚未刷新积分' }}
       </span>
+      <button
+        class="cb-refresh"
+        :disabled="refreshing"
+        title="刷新所有账号剩余积分"
+        @click.stop="handleRefresh"
+      >
+        {{ refreshing ? '刷新中…' : '刷新积分' }}
+      </button>
     </div>
 
     <div v-if="expanded" class="cb-body">
       <!-- 今日三项 -->
+      <div class="cb-today-head">
+        <span class="cb-today-title">今日</span>
+        <span class="cb-updated" :class="{ stale: updatedStale }">
+          数据截至 {{ updatedText }}<template v-if="updatedStale">（点刷新可更新）</template>
+        </span>
+      </div>
       <div class="cb-today">
         <div class="cb-stat">
           <span class="cb-stat-label">今日消耗</span>
@@ -32,30 +46,45 @@
       </div>
       <p v-if="!todaySnap" class="cb-hint">今日尚未刷新积分</p>
 
-      <!-- 近 7 天 -->
+      <!-- 近 N 天 -->
       <div class="cb-section">
-        <h3 class="cb-section-title">近 7 天</h3>
-        <table class="cb-table">
-          <thead>
-            <tr>
-              <th>日期</th>
-              <th class="num">新增</th>
-              <th class="num">消耗</th>
-              <th class="num">余额</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="s in recent" :key="s.date">
-              <td>{{ s.date }}</td>
-              <td class="num">{{ fmt(s.earned) }}</td>
-              <td class="num">{{ fmt(s.consumed) }}</td>
-              <td class="num">{{ fmt(s.total) }}</td>
-            </tr>
-            <tr v-if="recent.length === 0">
-              <td colspan="4" class="cb-empty">暂无快照</td>
-            </tr>
-          </tbody>
-        </table>
+        <div class="cb-section-head">
+          <h3 class="cb-section-title">{{ rangeLabel }}</h3>
+          <div class="cb-ranges">
+            <button
+              v-for="opt in rangeOptions"
+              :key="opt.value"
+              class="cb-range-btn"
+              :class="{ active: range === opt.value }"
+              @click="range = opt.value"
+            >
+              {{ opt.label }}
+            </button>
+          </div>
+        </div>
+        <div class="cb-table-wrap">
+          <table class="cb-table">
+            <thead>
+              <tr>
+                <th>日期</th>
+                <th class="num">新增</th>
+                <th class="num">消耗</th>
+                <th class="num">余额</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="s in recent" :key="s.date">
+                <td>{{ s.date }}</td>
+                <td class="num">{{ fmt(s.earned) }}</td>
+                <td class="num">{{ fmt(s.consumed) }}</td>
+                <td class="num">{{ fmt(s.total) }}</td>
+              </tr>
+              <tr v-if="recent.length === 0">
+                <td colspan="4" class="cb-empty">暂无快照</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
 
       <!-- 每账号当前余额 -->
@@ -79,6 +108,20 @@ import { useAppStore } from '../stores/app'
 
 const store = useAppStore()
 const expanded = ref(false)
+const refreshing = ref(false)
+
+// 时间范围档位:7 / 30 / 全部(90)
+const range = ref(7)
+const rangeOptions = [
+  { label: '近 7 天', value: 7 },
+  { label: '近 30 天', value: 30 },
+  { label: '全部', value: 90 }
+]
+const rangeLabel = computed(() => {
+  if (range.value === 7) return '近 7 天'
+  if (range.value === 30) return '近 30 天'
+  return '全部(90 天)'
+})
 
 // 北京时间今天,格式 YYYY-MM-DD(与后端 credits_daily.json 的 date 对齐)
 const todayStr = computed(() =>
@@ -89,15 +132,48 @@ const todaySnap = computed(() =>
   store.creditsDaily.find((s: { date: string }) => s.date === todayStr.value)
 )
 
-// 近 7 天,按日期倒序
+// 按选中档位切片,按日期倒序
 const recent = computed(() =>
-  [...store.creditsDaily].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 7)
+  [...store.creditsDaily].sort((a, b) => b.date.localeCompare(a.date)).slice(0, range.value)
 )
 
 // 每账号当前余额,降序(未知余额排最后)
 const balances = computed(() =>
   [...store.accounts].sort((a, b) => (b.remainingCredits ?? -1) - (a.remainingCredits ?? -1))
 )
+
+// 数据截至时间(来源 remaining_credits.json updated_at,形如 2026-10-31T20:54:07)
+const updatedAtDate = computed(() => {
+  const s = store.creditsUpdatedAt
+  if (!s) return null
+  const d = new Date(s)
+  return isNaN(d.getTime()) ? null : d
+})
+
+const updatedText = computed(() => {
+  const d = updatedAtDate.value
+  if (!d) return '—'
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`
+})
+
+// 距今超过 30 分钟 -> 橙色提示
+const updatedStale = computed(() => {
+  const d = updatedAtDate.value
+  if (!d) return false
+  return Date.now() - d.getTime() > 30 * 60 * 1000
+})
+
+async function handleRefresh() {
+  if (refreshing.value) return
+  refreshing.value = true
+  try {
+    await store.refreshAllCredits()
+    await Promise.all([store.fetchCreditsDaily(), store.fetchAccounts()])
+  } finally {
+    refreshing.value = false
+  }
+}
 
 function fmt(n: number): string {
   return n.toFixed(2)
@@ -142,8 +218,46 @@ function fmt(n: number): string {
   white-space: nowrap;
 }
 
+.cb-refresh {
+  flex-shrink: 0;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--glass-border);
+  background: var(--surface);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.cb-refresh:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 .cb-body {
   padding: 0 18px 16px;
+}
+
+.cb-today-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.cb-today-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.cb-updated {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.cb-updated.stale {
+  color: var(--warning);
 }
 
 .cb-today {
@@ -192,11 +306,46 @@ function fmt(n: number): string {
   margin-top: 14px;
 }
 
+.cb-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
 .cb-section-title {
   font-size: 12px;
   font-weight: 700;
   color: var(--text-secondary);
-  margin-bottom: 8px;
+  margin: 0;
+}
+
+.cb-ranges {
+  display: flex;
+  gap: 6px;
+}
+
+.cb-range-btn {
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--glass-border);
+  background: var(--surface);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.cb-range-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 700;
+}
+
+/* 超过 10 行时表格内部滚动,不撑高页面 */
+.cb-table-wrap {
+  max-height: 262px;
+  overflow-y: auto;
 }
 
 .cb-table {
