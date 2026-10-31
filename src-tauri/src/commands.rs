@@ -500,7 +500,7 @@ pub fn credits_export_csv(state: State<'_, AppState>) -> AppResult<Vec<String>> 
         crate::fs_utils::read_json(&state.data_path("credits_daily.json"));
     let export_dir = state.data_path("exports");
     std::fs::create_dir_all(&export_dir)?;
-    let stamp = chrono::Local::now().format("%Y%m%d_%H%M").to_string();
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
 
     let mut snaps = file.snapshots.clone();
     snaps.sort_by(|a, b| a.date.cmp(&b.date));

@@ -194,6 +194,10 @@ fn compute_consumed(
                 let Some(today_i) = today.get(uid) else {
                     continue;
                 };
+                // 余额为 0 的号即使签到记录 delta>0,也没有真实余额流动,不计消耗
+                if *prev_i <= 0.0 && *today_i <= 0.0 {
+                    continue;
+                }
                 let earned_i = earned_by_uid.get(uid).copied().unwrap_or(0.0);
                 consumed += (prev_i + earned_i - today_i).max(0.0);
             }
@@ -398,5 +402,24 @@ mod tests {
             compute_consumed(Some(&prev), &today, &HashMap::new(), 6600.0, 900.0);
         assert_eq!(consumed, 700.0);
         assert!(legacy);
+    }
+
+    /// 虚账挡板:余额 0 的号即使签到 delta>0,也不产生真实消耗
+    #[test]
+    fn consumed_skips_zero_balance_ghost_earn() {
+        let prev = CreditsDailySnapshot {
+            date: "2026-10-30".into(),
+            total: 0.0,
+            earned: 0.0,
+            consumed: 0.0,
+            per_account: Some(balances(&[("a", 0.0)])),
+            consumed_legacy: false,
+        };
+        let today = balances(&[("a", 0.0)]);
+        let earned_by_uid: HashMap<String, f64> = [("a".to_string(), 100.0)].into_iter().collect();
+
+        let (consumed, legacy) = compute_consumed(Some(&prev), &today, &earned_by_uid, 0.0, 100.0);
+        assert_eq!(consumed, 0.0);
+        assert!(!legacy);
     }
 }

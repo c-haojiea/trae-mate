@@ -94,7 +94,13 @@
               <tr v-for="s in recent" :key="s.date">
                 <td>{{ s.date }}</td>
                 <td class="num">{{ fmt(s.earned) }}</td>
-                <td class="num">{{ fmt(s.consumed) }}</td>
+                <td class="num">
+                  {{ fmt(s.consumed) }}<span
+                    v-if="s.consumed_legacy"
+                    class="cb-legacy-star"
+                    title="旧算法·净值口径,不代表真实消耗"
+                  >*</span>
+                </td>
                 <td class="num">{{ fmt(s.total) }}</td>
               </tr>
               <tr v-if="recent.length === 0">
@@ -103,6 +109,9 @@
             </tbody>
           </table>
         </div>
+        <p v-if="hasLegacyRow" class="cb-footnote">
+          * 该日由旧算法得出(|今日总额−新增−昨日总额|),新号入库与消耗会被互相抵消,不代表真实消耗
+        </p>
       </div>
 
       <!-- 每账号当前余额 -->
@@ -131,17 +140,17 @@ const refreshing = ref(false)
 const exporting = ref(false)
 const exportPaths = ref<string[]>([])
 
-// 时间范围档位:7 / 30 / 全部(90)
+// 时间范围档位:7 / 30 / 全部(0 = 不限条数,后端已永久保留)
 const range = ref(7)
 const rangeOptions = [
   { label: '近 7 天', value: 7 },
   { label: '近 30 天', value: 30 },
-  { label: '全部', value: 90 }
+  { label: '全部', value: 0 }
 ]
 const rangeLabel = computed(() => {
   if (range.value === 7) return '近 7 天'
   if (range.value === 30) return '近 30 天'
-  return '全部(90 天)'
+  return '全部'
 })
 
 // 北京时间今天,格式 YYYY-MM-DD(与后端 credits_daily.json 的 date 对齐)
@@ -153,10 +162,14 @@ const todaySnap = computed(() =>
   store.creditsDaily.find((s: { date: string }) => s.date === todayStr.value)
 )
 
-// 按选中档位切片,按日期倒序
-const recent = computed(() =>
-  [...store.creditsDaily].sort((a, b) => b.date.localeCompare(a.date)).slice(0, range.value)
-)
+// 按选中档位切片,按日期倒序(0=全部,不截断)
+const recent = computed(() => {
+  const sorted = [...store.creditsDaily].sort((a, b) => b.date.localeCompare(a.date))
+  return range.value === 0 ? sorted : sorted.slice(0, range.value)
+})
+
+// 当前表格内是否含旧算法行(决定脚注是否显示)
+const hasLegacyRow = computed(() => recent.value.some((s) => s.consumed_legacy))
 
 // 每账号当前余额,降序(未知余额排最后)
 const balances = computed(() =>
@@ -337,10 +350,18 @@ function fmt(n: number): string {
   margin: 6px 0 0;
 }
 
-.cb-legacy {
+.cb-legacy,
+.cb-legacy-star {
   font-size: 11px;
   font-weight: 400;
   color: var(--warning);
+}
+
+.cb-footnote {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin: 6px 0 0;
+  line-height: 1.5;
 }
 
 .cb-export-paths {
