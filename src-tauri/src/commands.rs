@@ -1131,6 +1131,47 @@ fn wait_login_and_import(app: &AppHandle, appdata: &str, temp_dir: &str) -> serd
     let data_dir = data_dir_path.to_string_lossy().to_string();
     let temp_kept = temp_path.exists();
 
+    // 新账号判定:单独取锁、判完即释放(下方 upsert 还会再取锁,不得重入)
+    let (is_new_account, accounts_machine_ids) = {
+        let state = app.state::<AppState>();
+        let data = state.data.lock().unwrap();
+        let accounts = data.get_accounts();
+        (
+            is_new_desktop_account(accounts, &user_id),
+            accounts
+                .iter()
+                .filter_map(|a| a.machine_id.as_deref())
+                .map(str::to_string)
+                .collect::<Vec<String>>(),
+        )
+    };
+
+    // 只有「新账号 + 本次确实写入凭据」才分配独立 telemetry.machineId;
+    // 目标实例在跑(未写凭据)时该目录可能仍绑定别的旧令牌,跳过并如实回报,不许猜
+    let mut assigned_mid: Option<String> = None;
+    if is_new_account && !credential_copied {
+        return serde_json::json!({
+            "success": false,
+            "error": "目标实例正在运行,本次未写入凭据,已跳过 telemetry.machineId 分配(请关闭该实例后重新登录导入)",
+            "machineIdAssigned": false,
+            "credentialCopied": false,
+            "tempKept": temp_kept
+        });
+    }
+    if should_assign_machine_mid(is_new_account, credential_copied) {
+        match assign_new_instance_machine_mid(&appdata_path, &data_dir, &accounts_machine_ids) {
+            Ok(mid) => assigned_mid = Some(mid),
+            Err(e) => {
+                return serde_json::json!({
+                    "success": false,
+                    "error": format!("分配 telemetry.machineId 失败: {e}"),
+                    "machineIdAssigned": false,
+                    "tempKept": temp_kept
+                })
+            }
+        }
+    }
+
     // upsert 账号(绑定标准目录 + 机器码 + 加密凭据)
     let encrypted = match credentials::encrypt_credential(&cred) {
         Ok(e) => e,
@@ -1173,8 +1214,111 @@ fn wait_login_and_import(app: &AppHandle, appdata: &str, temp_dir: &str) -> serd
         "name": cred.account_name,
         "userId": user_id,
         "credentialCopied": credential_copied,
-        "tempKept": temp_kept
+        "tempKept": temp_kept,
+        "machineIdAssigned": assigned_mid.is_some(),
+        "machineId": assigned_mid
     })
+}
+
+/// 账号库中不存在该 desktop_user_id 即视为新账号(调用方需自行保证不与其他锁重入)。
+fn is_new_desktop_account(accounts: &[Account], user_id: &str) -> bool {
+    !accounts
+        .iter()
+        .any(|a| a.desktop_user_id.as_deref() == Some(user_id))
+}
+
+/// 是否为本次导入分配独立 telemetry.machineId:只有新账号且本次确实写入凭据才分配。
+fn should_assign_machine_mid(is_new_account: bool, credential_copied: bool) -> bool {
+    is_new_account && credential_copied
+}
+
+/// 收集全机已用过的设备身份值(严格只读):
+/// - %APPDATA% 下 `TRAE SOLO CN_*` / `TRAE SOLO CN login *` / `Trae CN` 目录 storage.json 的 telemetry.machineId
+/// - 同批目录下的 machineid 文件内容
+/// - 账号库全部账号的 machineId 字段
+/// 不用 trae_instance::scan_instance_dirs:它会跳过无凭据目录,会漏掉 login 残留目录。
+fn collect_used_machine_ids(appdata: &Path, extra: &[String]) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    let mut used: HashSet<String> = HashSet::new();
+    for m in extra {
+        let t = m.trim();
+        if !t.is_empty() {
+            used.insert(t.to_string());
+        }
+    }
+    let prefix_dir = format!("{}_", trae_machine::DATA_DIR_NAME);
+    let prefix_login = format!("{} login ", trae_machine::DATA_DIR_NAME);
+    let Ok(entries) = std::fs::read_dir(appdata) else {
+        return used;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !(name == "Trae CN" || name.starts_with(&prefix_dir) || name.starts_with(&prefix_login)) {
+            continue;
+        }
+        let dir = entry.path();
+        let storage = dir.join("User").join("globalStorage").join("storage.json");
+        if let Ok(raw) = std::fs::read_to_string(&storage) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(mid) = v.get("telemetry.machineId").and_then(|x| x.as_str()) {
+                    let t = mid.trim();
+                    if !t.is_empty() {
+                        used.insert(t.to_string());
+                    }
+                }
+            }
+        }
+        if let Ok(raw) = std::fs::read_to_string(dir.join("machineid")) {
+            let t = raw.trim();
+            if !t.is_empty() {
+                used.insert(t.to_string());
+            }
+        }
+    }
+    used
+}
+
+/// 为新账号实例分配独立 telemetry.machineId(sha256 → 64 位小写 hex),与全机任一已用值不冲突。
+/// 只改 storage.json 的这一个键,其余键(devDeviceId / sqmId / 凭据)一字不动;
+/// machineid 文件与账号库 machine_id 不碰。写盘走 JSON 解析 + 序列化,失败不改文件。
+fn assign_new_instance_machine_mid(
+    appdata: &Path,
+    data_dir: &str,
+    account_machine_ids: &[String],
+) -> Result<String, String> {
+    let used = collect_used_machine_ids(appdata, account_machine_ids);
+    let mut candidate = String::new();
+    let mut found = false;
+    for _ in 0..8 {
+        candidate = trae_machine::telemetry_machine_id(&uuid::Uuid::new_v4().to_string());
+        if !used.contains(&candidate) {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return Err("连续 8 次生成的 telemetry.machineId 均与全机已用值冲突".into());
+    }
+
+    let storage = Path::new(data_dir)
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+    let raw = std::fs::read_to_string(&storage)
+        .map_err(|e| format!("读取目标 storage.json 失败: {e}"))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("目标 storage.json 解析失败: {e}"))?;
+    let Some(obj) = value.as_object_mut() else {
+        return Err("目标 storage.json 不是 JSON 对象,未写入".into());
+    };
+    obj.insert(
+        "telemetry.machineId".to_string(),
+        serde_json::Value::String(candidate.clone()),
+    );
+    let text = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("序列化目标 storage.json 失败: {e}"))?;
+    std::fs::write(&storage, text).map_err(|e| format!("写入目标 storage.json 失败: {e}"))?;
+    Ok(candidate)
 }
 
 /// 手动刷新账号凭证(卡片"刷新凭证"按钮):实例目录回读 + ExchangeToken 刷新 + 回写
@@ -1338,6 +1482,11 @@ mod tests {
     fn read_storage_json(dir: &Path) -> serde_json::Value {
         let path = dir.join("User").join("globalStorage").join("storage.json");
         serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn write_machineid(dir: &Path, raw: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("machineid"), raw).unwrap();
     }
 
     #[test]
@@ -1592,6 +1741,162 @@ mod tests {
         };
         assert!(bound_dir_usable(&account), "storage.json 存在即可用");
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 新号:分配 64 位小写 hex,且不动 devDeviceId / sqmId / 凭据 / machineid 文件
+    #[test]
+    fn new_account_mid_is_hex_and_preserves_other_keys() {
+        let root = case_dir("a40_new");
+        let appdata = root.join("appdata");
+        fs::create_dir_all(&appdata).unwrap();
+        let target = appdata.join(format!("{}_1009", trae_machine::DATA_DIR_NAME));
+        write_storage(
+            &target,
+            r#"{"telemetry.machineId":"OLD-MID","telemetry.devDeviceId":"OLD-DEV","telemetry.sqmId":"{OLD-SQM}","iCubeAuthInfo://icube.cloudide":"CRED"}"#,
+        );
+        write_machineid(&target, "uuid-file-value");
+        // 另一个 login 残留目录:其 machineid 也必须算作已占用
+        let other = appdata.join(format!("{} login 1111", trae_machine::DATA_DIR_NAME));
+        write_machineid(&other, "0959aaaa");
+
+        let extra = vec![
+            "0929e143d12044ec627feb22117a9379a2026161b6ae6efbc90b825aa19d9c5b".to_string(),
+        ];
+        let mid =
+            assign_new_instance_machine_mid(&appdata, &target.to_string_lossy(), &extra).unwrap();
+
+        assert_eq!(mid.len(), 64, "必须是 64 位");
+        assert!(
+            mid.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "必须全小写 hex: {mid}"
+        );
+        assert_ne!(mid, extra[0], "不得与账号库既有 machineId 冲突");
+        assert_ne!(mid, "uuid-file-value", "不得与 machineid 文件值冲突");
+
+        let merged = read_storage_json(&target);
+        assert_eq!(merged["telemetry.machineId"], mid.as_str(), "mid 已写入");
+        assert_eq!(merged["telemetry.devDeviceId"], "OLD-DEV", "devDeviceId 不得变");
+        assert_eq!(merged["telemetry.sqmId"], "{OLD-SQM}", "sqmId 不得变");
+        assert_eq!(
+            merged["iCubeAuthInfo://icube.cloudide"], "CRED",
+            "凭据不得变"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("machineid")).unwrap(),
+            "uuid-file-value",
+            "machineid 文件不得改"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 两个新号必须拿到互不相同的 mid
+    #[test]
+    fn two_new_accounts_get_distinct_mids() {
+        let root = case_dir("a40_two");
+        let appdata = root.join("appdata");
+        fs::create_dir_all(&appdata).unwrap();
+        let a = appdata.join(format!("{}_1010", trae_machine::DATA_DIR_NAME));
+        let b = appdata.join(format!("{}_1011", trae_machine::DATA_DIR_NAME));
+        write_storage(&a, r#"{"telemetry.machineId":"CONST"}"#);
+        write_storage(&b, r#"{"telemetry.machineId":"CONST"}"#);
+
+        let m1 = assign_new_instance_machine_mid(&appdata, &a.to_string_lossy(), &[]).unwrap();
+        let m2 = assign_new_instance_machine_mid(&appdata, &b.to_string_lossy(), &[]).unwrap();
+
+        assert_ne!(m1, m2, "两个新号必须互不相同");
+        assert_eq!(read_storage_json(&a)["telemetry.machineId"], m1.as_str());
+        assert_eq!(read_storage_json(&b)["telemetry.machineId"], m2.as_str());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 老账号:判定为已存在,一律不分配、不改文件
+    #[test]
+    fn existing_account_skips_mid_assignment() {
+        let accounts = vec![Account {
+            desktop_user_id: Some("u1".into()),
+            ..Default::default()
+        }];
+        assert!(!is_new_desktop_account(&accounts, "u1"), "库中已有该号即非新号");
+        assert!(is_new_desktop_account(&accounts, "u2"), "库中没有的号才是新号");
+        assert!(
+            !should_assign_machine_mid(false, true),
+            "老账号即使已写凭据也不得分配"
+        );
+
+        let root = case_dir("a40_old");
+        let appdata = root.join("appdata");
+        fs::create_dir_all(&appdata).unwrap();
+        let target = appdata.join(format!("{}_u1", trae_machine::DATA_DIR_NAME));
+        write_storage(&target, r#"{"telemetry.machineId":"KEEP-MID"}"#);
+        let path = target.join("User").join("globalStorage").join("storage.json");
+        let before = fs::read(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before, "老号文件字节不得改动");
+        assert_eq!(read_storage_json(&target)["telemetry.machineId"], "KEEP-MID");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 目标实例在跑(本次未写凭据):必须跳过分配
+    #[test]
+    fn skips_assignment_when_credential_not_copied() {
+        assert!(
+            !should_assign_machine_mid(true, false),
+            "credential_copied=false 必须跳过"
+        );
+        assert!(
+            should_assign_machine_mid(true, true),
+            "新号 + 已写凭据才分配"
+        );
+    }
+
+    /// 目标 storage.json 非对象:必须 Err 且文件字节不变
+    #[test]
+    fn assign_rejects_non_object_storage() {
+        let root = case_dir("a40_nonobj");
+        let appdata = root.join("appdata");
+        fs::create_dir_all(&appdata).unwrap();
+        let target = appdata.join(format!("{}_1012", trae_machine::DATA_DIR_NAME));
+        write_storage(&target, "\"abc\"");
+        let path = target.join("User").join("globalStorage").join("storage.json");
+        let before = fs::read(&path).unwrap();
+
+        let err =
+            assign_new_instance_machine_mid(&appdata, &target.to_string_lossy(), &[]).unwrap_err();
+
+        assert!(err.contains("不是 JSON 对象"), "错误须点明非对象: {err}");
+        assert_eq!(fs::read(&path).unwrap(), before, "文件字节不得改动");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 占用集合:storage.json 的 mid + machineid 文件 + 账号库 machineId,无关目录不收
+    #[test]
+    fn used_ids_collect_from_storage_machineid_and_accounts() {
+        let root = case_dir("a40_used");
+        let appdata = root.join("appdata");
+        fs::create_dir_all(&appdata).unwrap();
+        let inst = appdata.join(format!("{}_1013", trae_machine::DATA_DIR_NAME));
+        write_storage(&inst, r#"{"telemetry.machineId":"MID-IN-STORAGE"}"#);
+        write_machineid(&inst, "MID-IN-FILE");
+        let login = appdata.join(format!("{} login 2222", trae_machine::DATA_DIR_NAME));
+        write_machineid(&login, "MID-IN-LOGIN");
+        let main = appdata.join("Trae CN");
+        write_storage(&main, r#"{"telemetry.machineId":"MID-IN-MAIN"}"#);
+        let unrelated = appdata.join("Unrelated");
+        write_storage(&unrelated, r#"{"telemetry.machineId":"MID-IN-OTHER"}"#);
+
+        let used = collect_used_machine_ids(&appdata, &["MID-FROM-ACCOUNT".to_string()]);
+
+        for v in [
+            "MID-IN-STORAGE",
+            "MID-IN-FILE",
+            "MID-IN-LOGIN",
+            "MID-IN-MAIN",
+            "MID-FROM-ACCOUNT",
+        ] {
+            assert!(used.contains(v), "必须收集 {v}");
+        }
+        assert!(!used.contains("MID-IN-OTHER"), "无关目录不得收集");
         let _ = fs::remove_dir_all(&root);
     }
 }
