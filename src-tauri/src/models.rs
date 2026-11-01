@@ -427,6 +427,15 @@ pub struct CreditsDailySnapshot {
     /// 该条 consumed 是否由旧算法(净值绝对值)得出
     #[serde(default)]
     pub consumed_legacy: bool,
+    /// 本应用记录入账(签到 + 今日购买),与 earned 同义;旧快照无此字段,读入为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earned_recorded: Option<f64>,
+    /// 余额观测入账:昨日已存在账号的 max(0, 今日余额 − 昨日余额) 之和(新号排除)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earned_observed: Option<f64>,
+    /// 当日各账号最早到期秒(uid -> 秒);旧快照读入为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_account_expire: Option<std::collections::BTreeMap<String, i64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

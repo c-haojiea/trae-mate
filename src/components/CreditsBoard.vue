@@ -59,6 +59,13 @@
           <span class="cb-stat-value">{{ todaySnap ? fmt(todaySnap.total) : '—' }}</span>
         </div>
       </div>
+      <p v-if="todayGap > 0" class="cb-hint">
+        未计入口径的正向入账 {{ fmt(todayGap) }}
+        <span
+          class="cb-legacy"
+          title="earned 只统计本应用签到/购买；此项为余额观测入账与记录之差，可能对应客户端内领取、重登回填、退款"
+        >ⓘ</span>
+      </p>
       <p v-if="!todaySnap" class="cb-hint">今日尚未刷新积分</p>
       <p v-if="exportPaths.length" class="cb-export-paths">
         已导出：<br />{{ exportPaths[0] }}<br />{{ exportPaths[1] }}
@@ -112,6 +119,9 @@
         <p v-if="hasLegacyRow" class="cb-footnote">
           * 该日由旧算法得出(|今日总额−新增−昨日总额|),新号入库与消耗会被互相抵消,不代表真实消耗
         </p>
+        <p v-if="todayGap > 0" class="cb-footnote">
+          今日存在未计入口径的正向入账,消耗可能被低估
+        </p>
       </div>
 
       <!-- 每账号当前余额 -->
@@ -161,6 +171,16 @@ const todayStr = computed(() =>
 const todaySnap = computed(() =>
   store.creditsDaily.find((s: { date: string }) => s.date === todayStr.value)
 )
+
+// 未计入口径的正向入账 = 观测入账 − 本应用记录入账(仅新快照带这两个字段,旧快照按 0)
+type GapFields = { earned_recorded?: number | null; earned_observed?: number | null }
+const todayGap = computed(() => {
+  const s = todaySnap.value as unknown as GapFields | undefined
+  const recorded = s?.earned_recorded
+  const observed = s?.earned_observed
+  if (recorded == null || observed == null) return 0
+  return Math.max(0, observed - recorded)
+})
 
 // 按选中档位切片,按日期倒序(0=全部,不截断)
 const recent = computed(() => {

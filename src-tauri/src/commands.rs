@@ -501,16 +501,28 @@ pub fn credits_export_csv(state: State<'_, AppState>) -> AppResult<Vec<String>> 
     let mut snaps = file.snapshots.clone();
     snaps.sort_by(|a, b| a.date.cmp(&b.date));
 
-    let mut csv_daily = String::from("date,total,earned,consumed,legacy\r\n");
+    let mut csv_daily =
+        String::from("date,total,earned,earned_observed,earned_gap,consumed,legacy\r\n");
     for s in &snaps {
         // 旧数据(无 per_account)一律视为旧算法算出
         let legacy = s.consumed_legacy || s.per_account.is_none();
+        // 旧行没有观测入账/缺口字段:按空值输出,不做回填推算
+        let observed = s
+            .earned_observed
+            .map(|v| format!("{v:.2}"))
+            .unwrap_or_default();
+        let gap = match (s.earned_recorded, s.earned_observed) {
+            (Some(r), Some(o)) => format!("{:.2}", crate::credits::earned_gap(r, o)),
+            _ => String::new(),
+        };
         csv_daily.push_str(&format!(
-            "{},{:.2},{:.2},{:.2},{}\r\n",
+            "{},{},{},{},{},{},{}\r\n",
             s.date,
-            s.total,
-            s.earned,
-            s.consumed,
+            format!("{:.2}", s.total),
+            format!("{:.2}", s.earned),
+            observed,
+            gap,
+            format!("{:.2}", s.consumed),
             if legacy { "true" } else { "false" }
         ));
     }

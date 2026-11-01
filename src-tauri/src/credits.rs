@@ -211,9 +211,54 @@ fn compute_consumed(
     )
 }
 
+/// 余额观测入账:昨日已存在账号的 max(0, 今日余额 − 昨日余额) 之和。
+/// 今日新入库的 uid 不在昨日快照里,自然被排除(新号入库不计入账口径)。
+fn earned_observed(
+    prev: Option<&CreditsDailySnapshot>,
+    today: &std::collections::BTreeMap<String, f64>,
+) -> f64 {
+    let Some(prev_map) = prev.and_then(|p| p.per_account.as_ref()) else {
+        return 0.0;
+    };
+    let sum: f64 = prev_map
+        .iter()
+        .filter_map(|(uid, prev_i)| {
+            today
+                .get(uid.as_str())
+                .map(|today_i| (*today_i - *prev_i).max(0.0))
+        })
+        .sum();
+    round2(sum)
+}
+
+/// 余额上升的号数:净利润为正的号,其消耗在余额快照上不可观测
+fn unobservable_count(
+    prev: Option<&CreditsDailySnapshot>,
+    today: &std::collections::BTreeMap<String, f64>,
+) -> usize {
+    let Some(prev_map) = prev.and_then(|p| p.per_account.as_ref()) else {
+        return 0;
+    };
+    prev_map
+        .iter()
+        .filter(|(uid, prev_i)| {
+            today
+                .get(uid.as_str())
+                .map_or(false, |today_i| *today_i - **prev_i > 0.0)
+        })
+        .count()
+}
+
+/// 记录入账与观测入账的缺口:只暴露正向(观测 > 记录,说明存在本应用未记录的入账)
+pub fn earned_gap(recorded: f64, observed: f64) -> f64 {
+    round2((observed - recorded).max(0.0))
+}
+
 /// 记录每日积分快照(每天计算一次):total=所有账号剩余积分之和;
 /// earned=今日签到获得(delta 之和)+ 购买获得;
 /// consumed 优先按账号求和(见 compute_consumed),昨日缺 per_account 时退回旧公式并标 legacy。
+/// earned_recorded=earned(本应用记录入账);earned_observed=余额观测入账(新号排除);
+/// 两者之差即「不可观测消耗」的正向证据(见 earned_gap);per_account_expire 供到期账使用。
 pub fn record_daily_snapshot(
     state: &crate::store::AppState,
     rc: &RemainingCreditsFile,
@@ -247,6 +292,14 @@ pub fn record_daily_snapshot(
         .cloned();
     let (consumed, legacy) =
         compute_consumed(prev.as_ref(), &today_map, &earned_by_uid, total, earned);
+    let observed = earned_observed(prev.as_ref(), &today_map);
+    let unobservable = unobservable_count(prev.as_ref(), &today_map);
+    let per_account_expire: std::collections::BTreeMap<String, i64> = rc
+        .expire_times
+        .iter()
+        .filter(|(uid, _)| today_map.contains_key(uid.as_str()))
+        .map(|(uid, ts)| (uid.clone(), *ts))
+        .collect();
 
     let snap = CreditsDailySnapshot {
         date: today.clone(),
@@ -255,11 +308,27 @@ pub fn record_daily_snapshot(
         consumed,
         per_account: Some(today_map),
         consumed_legacy: legacy,
+        earned_recorded: Some(earned),
+        earned_observed: Some(observed),
+        per_account_expire: if per_account_expire.is_empty() {
+            None
+        } else {
+            Some(per_account_expire)
+        },
     };
     if let Some(existing) = file.snapshots.iter_mut().find(|s| s.date == today) {
         // 同日重复刷新:整条重写(earned 由当日历史重新求和,不累加)
         *existing = snap;
     } else {
+        // 仅当日首次新建快照时记录一次不可观测号数,同日重复刷新不再追写日志
+        if unobservable > 0 {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "积分快照: {unobservable} 个账号余额上升,其消耗不可观测(记录入账 {earned:.2} / 观测入账 {observed:.2})"
+                ),
+            );
+        }
         file.snapshots.push(snap);
     }
 
@@ -373,6 +442,7 @@ mod tests {
             consumed: 0.0,
             per_account: Some(balances(&[("a", 5000.0)])),
             consumed_legacy: false,
+            ..Default::default()
         };
         let today = balances(&[("a", 3900.0), ("b", 2700.0)]);
         let earned_by_uid: HashMap<String, f64> = [("a".to_string(), 900.0)].into_iter().collect();
@@ -395,6 +465,7 @@ mod tests {
             consumed: 0.0,
             per_account: None,
             consumed_legacy: false,
+            ..Default::default()
         };
         let today = balances(&[("a", 3900.0), ("b", 2700.0)]);
 
@@ -414,6 +485,7 @@ mod tests {
             consumed: 0.0,
             per_account: Some(balances(&[("a", 0.0)])),
             consumed_legacy: false,
+            ..Default::default()
         };
         let today = balances(&[("a", 0.0)]);
         let earned_by_uid: HashMap<String, f64> = [("a".to_string(), 100.0)].into_iter().collect();
@@ -421,5 +493,75 @@ mod tests {
         let (consumed, legacy) = compute_consumed(Some(&prev), &today, &earned_by_uid, 0.0, 100.0);
         assert_eq!(consumed, 0.0);
         assert!(!legacy);
+    }
+
+    /// 观测入账只统计昨日已存在的号:今日新入库的 uid 不得计入
+    #[test]
+    fn earned_observed_excludes_new_accounts() {
+        let prev = CreditsDailySnapshot {
+            date: "2026-10-31".into(),
+            total: 1000.0,
+            earned: 0.0,
+            consumed: 0.0,
+            per_account: Some(balances(&[("old", 1000.0)])),
+            consumed_legacy: false,
+            ..Default::default()
+        };
+        let today = balances(&[("old", 1200.0), ("new", 2900.0)]);
+
+        assert_eq!(
+            earned_observed(Some(&prev), &today),
+            200.0,
+            "新号 2900 入库必须排除,只留旧号 +200"
+        );
+        assert_eq!(unobservable_count(Some(&prev), &today), 1, "仅余额上升的旧号计入");
+    }
+
+    /// 昨日已存在号既签到(记录 100)又外部入账(余额 +600):gap=500,消耗不得为负
+    #[test]
+    fn earned_gap_exposes_unrecorded_increase_without_negative_consumed() {
+        let prev = CreditsDailySnapshot {
+            date: "2026-10-31".into(),
+            total: 1000.0,
+            earned: 0.0,
+            consumed: 0.0,
+            per_account: Some(balances(&[("a", 1000.0)])),
+            consumed_legacy: false,
+            ..Default::default()
+        };
+        let today = balances(&[("a", 1600.0)]);
+        let earned_by_uid: HashMap<String, f64> = [("a".to_string(), 100.0)].into_iter().collect();
+
+        let (consumed, legacy) =
+            compute_consumed(Some(&prev), &today, &earned_by_uid, 1600.0, 100.0);
+        assert_eq!(consumed, 0.0, "余额净增时消耗必须钳到 0,不得为负");
+        assert!(!legacy);
+        assert_eq!(earned_observed(Some(&prev), &today), 600.0);
+        assert_eq!(earned_gap(100.0, 600.0), 500.0, "记录 100 与观测 600 之差即缺口");
+    }
+
+    /// 无签到记录的正向入账 + 同日无下降:consumed=0,gap>0
+    #[test]
+    fn earned_gap_positive_when_increase_unrecorded() {
+        let prev = CreditsDailySnapshot {
+            date: "2026-10-31".into(),
+            total: 500.0,
+            earned: 0.0,
+            consumed: 0.0,
+            per_account: Some(balances(&[("a", 500.0)])),
+            consumed_legacy: false,
+            ..Default::default()
+        };
+        let today = balances(&[("a", 800.0)]);
+
+        let (consumed, legacy) =
+            compute_consumed(Some(&prev), &today, &HashMap::new(), 800.0, 0.0);
+        assert_eq!(consumed, 0.0, "无记录且余额上升,消耗为 0");
+        assert!(!legacy);
+
+        let observed = earned_observed(Some(&prev), &today);
+        assert_eq!(observed, 300.0);
+        assert!(earned_gap(0.0, observed) > 0.0, "未记录的正向入账必须暴露为缺口");
+        assert!(earned_gap(0.0, observed) <= observed, "缺口不得超过观测入账");
     }
 }
