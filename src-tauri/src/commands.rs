@@ -908,7 +908,8 @@ pub fn focus_account_instance(id: String, state: State<'_, AppState>) -> AppResu
 
 /// 把临时登录目录迁移为标准实例目录 `TRAE SOLO CN_{userId}`。
 /// 返回 (实际目录, 是否已写入新凭据)。
-/// 目标目录已存在时绝不删除既有内容:仅备份并覆盖 `storage.json`;
+/// 目标目录已存在时绝不删除既有内容:仅备份并合并写入 `storage.json`
+/// (临时对象的键覆盖目标,但目标已有的设备身份键原样保留);
 /// 目标实例正在运行时完全不写文件,保留临时目录并返回 false。
 pub(crate) fn relocate_login_dir(
     appdata: &Path,
@@ -938,10 +939,61 @@ pub(crate) fn relocate_login_dir(
         if let Some(parent) = target_storage.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::copy(&temp_storage, &target_storage)?;
+        let temp_json: serde_json::Value = {
+            let raw = std::fs::read_to_string(&temp_storage)?;
+            serde_json::from_str(&raw)
+                .map_err(|_| AppError::Launch("临时 storage.json 解析失败".into()))?
+        };
+        let merged = if target_storage.exists() {
+            let raw = std::fs::read_to_string(&target_storage)?;
+            let target_json: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|_| AppError::Launch("目标 storage.json 解析失败，已备份，未覆盖".into()))?;
+            merge_storage_keep_device_identity(target_json, &temp_json)
+        } else {
+            temp_json
+        };
+        std::fs::write(&target_storage, serde_json::to_string_pretty(&merged)?)?;
     }
     let _ = std::fs::remove_dir_all(temp_dir);
     Ok((target, true))
+}
+
+/// 合并 storage.json:临时对象的键覆盖目标对象,但目标已有的非空设备身份键
+/// (`telemetry.machineId` / `telemetry.devDeviceId` / `telemetry.sqmId`)必须用目标原值覆盖回来。
+/// 理由:已登录老账号的 mid 被改写会让刷新令牌被判 20403「Token device not match」而丢失登录态。
+/// 目标或临时不是 JSON 对象时退化为直接使用临时对象(等同旧的整体覆盖)。
+fn merge_storage_keep_device_identity(
+    target: serde_json::Value,
+    temp: &serde_json::Value,
+) -> serde_json::Value {
+    const DEVICE_KEYS: [&str; 3] = [
+        "telemetry.machineId",
+        "telemetry.devDeviceId",
+        "telemetry.sqmId",
+    ];
+    match (target, temp) {
+        (serde_json::Value::Object(mut target_obj), serde_json::Value::Object(temp_obj)) => {
+            // 先快照目标已有的设备身份值(仅非空字符串),合并后再覆盖回去
+            let kept: Vec<(String, String)> = DEVICE_KEYS
+                .iter()
+                .filter_map(|k| {
+                    target_obj
+                        .get(*k)
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| (k.to_string(), s.to_string()))
+                })
+                .collect();
+            for (k, v) in temp_obj {
+                target_obj.insert(k.clone(), v.clone());
+            }
+            for (k, v) in kept {
+                target_obj.insert(k, serde_json::Value::String(v));
+            }
+            serde_json::Value::Object(target_obj)
+        }
+        (_, other) => other.clone(),
+    }
 }
 
 /// 打开新的空白 TRAE 实例供用户登录,后台轮询登录完成后自动导入账号:
@@ -1267,6 +1319,11 @@ mod tests {
             .count()
     }
 
+    fn read_storage_json(dir: &Path) -> serde_json::Value {
+        let path = dir.join("User").join("globalStorage").join("storage.json");
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
     #[test]
     fn relocate_renames_when_target_missing() {
         let root = case_dir("new");
@@ -1296,27 +1353,101 @@ mod tests {
         let target = appdata.join(format!("{}_1002", trae_machine::DATA_DIR_NAME));
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("marker.txt"), "keep").unwrap();
-        write_storage(&target, "old-storage");
+        write_storage(
+            &target,
+            r#"{"telemetry.machineId":"OLD-MID","telemetry.devDeviceId":"OLD-DEV","iCubeAuthInfo://icube.cloudide":"OLD-CRED","keep.setting":"from-target"}"#,
+        );
         let temp = root.join("TRAE SOLO CN login temp2");
-        write_storage(&temp, "new-storage");
+        write_storage(
+            &temp,
+            r#"{"telemetry.machineId":"NEW-MID","telemetry.devDeviceId":"NEW-DEV","iCubeAuthInfo://icube.cloudide":"NEW-CRED","temp.setting":"from-temp"}"#,
+        );
 
         let (got, copied) = relocate_login_dir(&appdata, &temp, "1002", false).unwrap();
 
         assert_eq!(got, target, "返回既有目录而非临时目录");
-        assert!(copied, "凭据已覆盖");
+        assert!(copied, "凭据已合并写入");
         assert_eq!(
             fs::read_to_string(target.join("marker.txt")).unwrap(),
             "keep",
             "既有文件不被删除"
         );
         let storage_dir = target.join("User").join("globalStorage");
+        let merged = read_storage_json(&target);
         assert_eq!(
-            fs::read_to_string(storage_dir.join("storage.json")).unwrap(),
-            "new-storage",
-            "storage.json 已更新"
+            merged["telemetry.machineId"], "OLD-MID",
+            "设备身份 mid 必须目标优先,否则老账号刷新会 20403"
         );
+        assert_eq!(
+            merged["telemetry.devDeviceId"], "OLD-DEV",
+            "设备身份 devDeviceId 必须目标优先"
+        );
+        assert_eq!(
+            merged["iCubeAuthInfo://icube.cloudide"], "NEW-CRED",
+            "凭据必须来自临时目录"
+        );
+        assert_eq!(merged["keep.setting"], "from-target", "目标独有键保留");
+        assert_eq!(merged["temp.setting"], "from-temp", "临时独有键合入");
         assert_eq!(backups_in(&storage_dir), 1, "生成 storage.json.bak_* 备份");
         assert!(!temp.exists(), "临时目录已清理");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 目标 storage.json 非法:必须报错、不动目标字节,且备份照常生成
+    #[test]
+    fn relocate_rejects_invalid_target_json() {
+        let root = case_dir("bad_target");
+        let appdata = root.join("appdata");
+        let target = appdata.join(format!("{}_1005", trae_machine::DATA_DIR_NAME));
+        let storage_dir = target.join("User").join("globalStorage");
+        fs::create_dir_all(&storage_dir).unwrap();
+        let target_storage = storage_dir.join("storage.json");
+        fs::write(&target_storage, "not-json").unwrap();
+        let before = fs::read(&target_storage).unwrap();
+        let temp = root.join("TRAE SOLO CN login temp5");
+        write_storage(
+            &temp,
+            r#"{"telemetry.machineId":"NEW-MID","iCubeAuthInfo://icube.cloudide":"NEW-CRED"}"#,
+        );
+
+        let res = relocate_login_dir(&appdata, &temp, "1005", false);
+
+        assert!(
+            matches!(res, Err(AppError::Launch(ref m)) if m.contains("目标 storage.json 解析失败")),
+            "非法目标必须返回 Err: {res:?}"
+        );
+        assert_eq!(
+            fs::read(&target_storage).unwrap(),
+            before,
+            "目标 storage.json 字节不得改动"
+        );
+        assert_eq!(backups_in(&storage_dir), 1, "已备份原文件");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 目标缺 mid、临时带 mid:设备身份键回落取临时值
+    #[test]
+    fn relocate_uses_temp_mid_when_target_missing_key() {
+        let root = case_dir("missing_mid");
+        let appdata = root.join("appdata");
+        let target = appdata.join(format!("{}_1006", trae_machine::DATA_DIR_NAME));
+        write_storage(&target, r#"{"iCubeAuthInfo://icube.cloudide":"OLD-CRED"}"#);
+        let temp = root.join("TRAE SOLO CN login temp6");
+        write_storage(
+            &temp,
+            r#"{"telemetry.machineId":"NEW-MID","iCubeAuthInfo://icube.cloudide":"NEW-CRED"}"#,
+        );
+
+        let (got, copied) = relocate_login_dir(&appdata, &temp, "1006", false).unwrap();
+
+        assert_eq!(got, target);
+        assert!(copied);
+        let merged = read_storage_json(&target);
+        assert_eq!(
+            merged["telemetry.machineId"], "NEW-MID",
+            "目标无 mid 时必须取临时值"
+        );
+        assert_eq!(merged["iCubeAuthInfo://icube.cloudide"], "NEW-CRED");
         let _ = fs::remove_dir_all(&root);
     }
 

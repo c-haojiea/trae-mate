@@ -40,21 +40,14 @@ pub fn generate_machine_guid() -> String {
     Uuid::new_v4().to_string()
 }
 
-/// telemetry.machineId 派生(对应 Account Manager 的 md5_hash,基于 DefaultHasher,非标准 MD5)
+/// telemetry.machineId 派生:sha256(域前缀 + 机器码) → 64 位小写 hex。
+/// 仅用于「storage.json 中该键缺失」时补值;已存在的值一律保留(见 choose_telemetry_machine_id)。
 pub fn telemetry_machine_id(machine_id: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut h1 = DefaultHasher::new();
-    machine_id.hash(&mut h1);
-    let v1 = h1.finish();
-
-    let mut h2 = DefaultHasher::new();
-    format!("{}{}", machine_id, v1).hash(&mut h2);
-    let v2 = h2.finish();
-
-    let combined = ((v1 as u128) << 64) | (v2 as u128);
-    format!("{:x}", combined)
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"trae-mate:telemetry.machineId:");
+    h.update(machine_id.as_bytes());
+    format!("{:x}", h.finalize())
 }
 
 // ===== exe 路径 =====
@@ -247,6 +240,8 @@ pub fn open_product_with_data_dir(
         return Err(AppError::Launch(format!("TRAE 路径无效: {exe_path}")));
     }
     fs::create_dir_all(data_dir)?;
+    // 启动前清理残留 code.lock:强杀会留下死锁文件,不清理则本次启动报 mutex already exists
+    clear_stale_lock(data_dir);
     let mut cmd = Command::new(&exe);
     cmd.arg("--user-data-dir").arg(data_dir);
     if let Some(ext) = extensions_dir {
@@ -329,6 +324,34 @@ pub fn is_instance_running(data_dir: &str) -> (bool, Option<u32>) {
         // 非 Windows 不支持运行检测(签到工具本就仅 Windows)
         let _ = pid;
         (false, None)
+    }
+}
+
+/// 解析 code.lock 内容为 PID;非法内容(非数字/空/带乱码)返回 None,代表残留锁。
+fn parse_lock_pid(raw: &str) -> Option<u32> {
+    raw.trim().parse::<u32>().ok()
+}
+
+/// 启动前清理残留 code.lock:仅当锁内 PID 经 tasklist 白名单校验确认「不是 TRAE 实例」时才删除。
+/// 实例确实在运行时必须保留,否则上层会误判未运行而重复拉起。
+/// 失败一律忽略,绝不阻断启动。
+pub fn clear_stale_lock(data_dir: &str) {
+    let lock_path = Path::new(data_dir).join("code.lock");
+    if !lock_path.exists() {
+        return;
+    }
+    let pid = fs::read_to_string(&lock_path)
+        .ok()
+        .and_then(|s| parse_lock_pid(&s));
+    #[cfg(target_os = "windows")]
+    let alive = pid.map(tasklist_confirms_pid).unwrap_or(false);
+    #[cfg(not(target_os = "windows"))]
+    let alive = {
+        let _ = pid;
+        false
+    };
+    if !alive {
+        let _ = fs::remove_file(&lock_path);
     }
 }
 
@@ -547,6 +570,21 @@ mod tests {
         let c = telemetry_machine_id("xyz-789");
         assert_ne!(a, c, "不同输入应产生不同输出");
         assert!(!a.is_empty());
+        assert_eq!(a.len(), 64, "sha256 输出应为 64 位 hex");
+        assert!(
+            a.chars()
+                .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()),
+            "应全为小写 hex 字符: {a}"
+        );
+    }
+
+    /// code.lock 内容解析:纯数字(含首尾空白)才算 PID,其余一律视为残留锁
+    #[test]
+    fn parse_lock_pid_accepts_digits_only() {
+        assert_eq!(parse_lock_pid("12345\n"), Some(12345));
+        assert_eq!(parse_lock_pid(" 12345 "), Some(12345));
+        assert_eq!(parse_lock_pid("abc"), None);
+        assert_eq!(parse_lock_pid(""), None);
     }
 
     #[test]
