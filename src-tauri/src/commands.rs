@@ -124,16 +124,12 @@ fn instance_logged_in(data_dir: Option<&str>) -> Option<bool> {
         .join("storage.json");
     let text = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    // 实际键名为 iCubeAuthInfo://icube.cloudide(个别版本写作 cube.cloudide),两者都认
-    let ok = ["iCubeAuthInfo://icube.cloudide", "iCubeAuthInfo://cube.cloudide"]
-        .iter()
-        .any(|k| {
-            value
-                .get(*k)
-                .and_then(|v| v.as_str())
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-        });
+    // 键名实测为 iCubeAuthInfo://icube.cloudide(部分版本曾写作 cube.cloudide,已确认为无效键)
+    let ok = value
+        .get("iCubeAuthInfo://icube.cloudide")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
     Some(ok)
 }
 
@@ -944,10 +940,18 @@ pub(crate) fn relocate_login_dir(
             serde_json::from_str(&raw)
                 .map_err(|_| AppError::Launch("临时 storage.json 解析失败".into()))?
         };
+        if !temp_json.is_object() {
+            return Err(AppError::Launch("临时 storage.json 不是 JSON 对象".into()));
+        }
         let merged = if target_storage.exists() {
             let raw = std::fs::read_to_string(&target_storage)?;
             let target_json: serde_json::Value = serde_json::from_str(&raw)
                 .map_err(|_| AppError::Launch("目标 storage.json 解析失败，已备份，未覆盖".into()))?;
+            if !target_json.is_object() {
+                return Err(AppError::Launch(
+                    "目标 storage.json 不是 JSON 对象，已备份，未覆盖".into(),
+                ));
+            }
             merge_storage_keep_device_identity(target_json, &temp_json)
         } else {
             temp_json
@@ -961,7 +965,7 @@ pub(crate) fn relocate_login_dir(
 /// 合并 storage.json:临时对象的键覆盖目标对象,但目标已有的非空设备身份键
 /// (`telemetry.machineId` / `telemetry.devDeviceId` / `telemetry.sqmId`)必须用目标原值覆盖回来。
 /// 理由:已登录老账号的 mid 被改写会让刷新令牌被判 20403「Token device not match」而丢失登录态。
-/// 目标或临时不是 JSON 对象时退化为直接使用临时对象(等同旧的整体覆盖)。
+/// 调用方已保证两边都是 JSON 对象,此处兜底分支仅为防御。
 fn merge_storage_keep_device_identity(
     target: serde_json::Value,
     temp: &serde_json::Value,
@@ -1448,6 +1452,64 @@ mod tests {
             "目标无 mid 时必须取临时值"
         );
         assert_eq!(merged["iCubeAuthInfo://icube.cloudide"], "NEW-CRED");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 目标 storage.json 是合法 JSON 但不是对象:必须报错,目标字节不动,备份照常
+    #[test]
+    fn relocate_rejects_non_object_target_json() {
+        let root = case_dir("nonobj_target");
+        let appdata = root.join("appdata");
+        let target = appdata.join(format!("{}_1007", trae_machine::DATA_DIR_NAME));
+        let storage_dir = target.join("User").join("globalStorage");
+        fs::create_dir_all(&storage_dir).unwrap();
+        let target_storage = storage_dir.join("storage.json");
+        fs::write(&target_storage, "\"abc\"").unwrap();
+        let before = fs::read(&target_storage).unwrap();
+        let temp = root.join("TRAE SOLO CN login temp7");
+        write_storage(&temp, r#"{"telemetry.machineId":"NEW-MID"}"#);
+
+        let res = relocate_login_dir(&appdata, &temp, "1007", false);
+
+        assert!(
+            matches!(res, Err(AppError::Launch(ref m)) if m.contains("不是 JSON 对象")),
+            "非对象目标必须返回 Err: {res:?}"
+        );
+        assert_eq!(
+            fs::read(&target_storage).unwrap(),
+            before,
+            "目标 storage.json 字节不得改动"
+        );
+        assert_eq!(backups_in(&storage_dir), 1, "已备份原文件");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 临时 storage.json 是合法 JSON 但不是对象:必须报错,目标字节不动
+    #[test]
+    fn relocate_rejects_non_object_temp_json() {
+        let root = case_dir("nonobj_temp");
+        let appdata = root.join("appdata");
+        let target = appdata.join(format!("{}_1008", trae_machine::DATA_DIR_NAME));
+        let storage_dir = target.join("User").join("globalStorage");
+        fs::create_dir_all(&storage_dir).unwrap();
+        let target_storage = storage_dir.join("storage.json");
+        fs::write(&target_storage, r#"{"telemetry.machineId":"OLD-MID"}"#).unwrap();
+        let before = fs::read(&target_storage).unwrap();
+        let temp = root.join("TRAE SOLO CN login temp8");
+        write_storage(&temp, "\"abc\"");
+
+        let res = relocate_login_dir(&appdata, &temp, "1008", false);
+
+        assert!(
+            matches!(res, Err(AppError::Launch(_))),
+            "非对象临时必须返回 Err: {res:?}"
+        );
+        assert_eq!(
+            fs::read(&target_storage).unwrap(),
+            before,
+            "目标 storage.json 字节不得改动"
+        );
+        assert_eq!(backups_in(&storage_dir), 1, "已备份原文件");
         let _ = fs::remove_dir_all(&root);
     }
 
