@@ -66,6 +66,13 @@
           title="earned 只统计本应用签到/购买；此项为余额观测入账与记录之差，可能对应客户端内领取、重登回填、退款"
         >ⓘ</span>
       </p>
+      <p v-if="todayExpired > 0" class="cb-hint">
+        含已过期额度 {{ fmt(todayExpired) }}
+        <span
+          class="cb-legacy"
+          title="该额度已过期但 TRAE 仍将其留在额度列表并计入余额"
+        >ⓘ</span>
+      </p>
       <p v-if="!todaySnap" class="cb-hint">今日尚未刷新积分</p>
       <p v-if="exportPaths.length" class="cb-export-paths">
         已导出：<br />{{ exportPaths[0] }}<br />{{ exportPaths[1] }}
@@ -180,6 +187,12 @@ const todayGap = computed(() => {
   const observed = s?.earned_observed
   if (recorded == null || observed == null) return 0
   return Math.max(0, observed - recorded)
+})
+
+// 已过期未用额度(虚账):旧快照无此字段,按 0
+const todayExpired = computed(() => {
+  const s = todaySnap.value as unknown as { expired?: number | null } | undefined
+  return s?.expired ?? 0
 })
 
 // 按选中档位切片,按日期倒序(0=全部,不截断)

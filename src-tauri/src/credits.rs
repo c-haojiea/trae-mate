@@ -19,14 +19,14 @@ fn round2(v: f64) -> f64 {
 }
 
 /// 调用 TRAE API 计算剩余积分。
-/// 返回 (剩余积分, 最早过期时间(Unix秒), 今日购买获得积分)。
+/// 返回 (剩余积分, 最早过期时间(Unix秒), 今日购买获得积分, 已过期未用额度)。
 /// 计算:遍历 user_entitlement_pack_list,仅对 quota.credits_limit 存在的包,
 /// 剩余 = credits_limit - usage.credits_amount(≥0) 求和;expire_time > now 取最早;
-/// start_time 今日本地时间且 charge_amount>0 计"今日购买"。
+/// start_time 今日本地时间且 charge_amount>0 计"今日购买";expire_time<=now 的剩余额度计入"已过期额度"。
 pub async fn calc_remaining_credits(
     jwt: &str,
     client: &reqwest::Client,
-) -> Result<(f64, Option<i64>, f64), String> {
+) -> Result<(f64, Option<i64>, f64, f64), String> {
     let auth = crate::jwt::normalize_full(jwt);
     let resp = client
         .post("https://api.trae.cn/trae/api/v2/pay/ide_user_ent_usage")
@@ -49,10 +49,6 @@ pub async fn calc_remaining_credits(
         .and_then(|v| v.as_array())
         .ok_or_else(|| "响应中缺少 user_entitlement_pack_list".to_string())?;
 
-    let mut total: f64 = 0.0;
-    let mut earliest_expire: Option<i64> = None;
-    let mut today_non_checkin_earned: f64 = 0.0;
-
     let now_ts = chrono::Utc::now().timestamp();
     // 今日北京时间范围 [00:00:00 +08:00, 次日 00:00:00 +08:00]
     let today_start = chrono::Utc::now()
@@ -65,53 +61,89 @@ pub async fn calc_remaining_credits(
         .timestamp();
     let today_end = today_start + 86_400;
 
+    let totals = sum_packs(packs, now_ts, today_start, today_end);
+    Ok((
+        totals.total,
+        totals.earliest_expire,
+        totals.today_purchased,
+        totals.expired_remaining,
+    ))
+}
+
+/// 额度包聚合结果。total 语义不变(仍含已过期包),expired_remaining 单独暴露虚账。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PackTotals {
+    pub total: f64,
+    pub earliest_expire: Option<i64>,
+    pub today_purchased: f64,
+    pub expired_remaining: f64,
+}
+
+/// 遍历额度包求和(纯函数,便于单测):
+/// - total = Σ(credits_limit - used).max(0),含已过期包(保持旧语义,避免余额跳变误判消耗)
+/// - earliest_expire = 未过期包中最早的 expire_time
+/// - today_purchased = start_time 落在 [today_start, today_end) 且 charge_amount>0 的 credits_limit
+/// - expired_remaining = Σ 已过期包(expire_time <= now)的剩余额度
+pub fn sum_packs(
+    packs: &[serde_json::Value],
+    now_ts: i64,
+    today_start: i64,
+    today_end: i64,
+) -> PackTotals {
+    let mut totals = PackTotals::default();
+    let mut total = 0.0f64;
+    let mut expired_remaining = 0.0f64;
     for pack in packs {
         let credits_limit = pack
             .get("entitlement_base_info")
             .and_then(|e| e.get("quota"))
             .and_then(|q| q.get("credits_limit"))
             .and_then(|v| v.as_f64());
-        if let Some(limit) = credits_limit {
-            let used = pack
-                .get("usage")
-                .and_then(|u| u.get("credits_amount"))
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            total += (limit - used).max(0.0);
+        let Some(limit) = credits_limit else {
+            continue;
+        };
+        let used = pack
+            .get("usage")
+            .and_then(|u| u.get("credits_amount"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let remaining = (limit - used).max(0.0);
+        total += remaining;
 
-            // expire_time 在 pack 顶层,取最早的(且未过期)
-            let expire = pack.get("expire_time").and_then(|v| v.as_i64());
-            if let Some(exp) = expire {
-                if exp > now_ts {
-                    earliest_expire = Some(earliest_expire.map_or(exp, |e| e.min(exp)));
-                }
+        // expire_time 在 pack 顶层,取最早且未过期的
+        let expire = pack.get("expire_time").and_then(|v| v.as_i64());
+        if let Some(exp) = expire {
+            if exp > now_ts {
+                totals.earliest_expire =
+                    Some(totals.earliest_expire.map_or(exp, |e| e.min(exp)));
+            } else {
+                // 已过期:额度仍留在 total 里(TRAE 不扣余额),单独统计为虚账
+                expired_remaining += remaining;
             }
+        }
 
-            // 今日购买获得的积分:start_time 在今日北京时间范围内且 charge_amount > 0
-            // (签到获得的 pack charge_amount=0,不会误判为购买积分)
-            let start_time = pack
-                .get("entitlement_base_info")
-                .and_then(|e| e.get("start_time"))
-                .and_then(|v| v.as_i64());
-            let charge_amount = pack
-                .get("entitlement_base_info")
-                .and_then(|e| e.get("charge_amount"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let is_purchased = charge_amount > 0;
-            if let Some(st) = start_time {
-                if st >= today_start && st < today_end && is_purchased {
-                    today_non_checkin_earned += limit;
-                }
+        // 今日购买获得的积分:start_time 在今日北京时间范围内且 charge_amount > 0
+        // (签到获得的 pack charge_amount=0,不会误判为购买积分)
+        let start_time = pack
+            .get("entitlement_base_info")
+            .and_then(|e| e.get("start_time"))
+            .and_then(|v| v.as_i64());
+        let charge_amount = pack
+            .get("entitlement_base_info")
+            .and_then(|e| e.get("charge_amount"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let is_purchased = charge_amount > 0;
+        if let Some(st) = start_time {
+            if st >= today_start && st < today_end && is_purchased {
+                totals.today_purchased += limit;
             }
         }
     }
-
-    Ok((
-        round2(total),
-        earliest_expire,
-        round2(today_non_checkin_earned),
-    ))
+    totals.total = round2(total);
+    totals.today_purchased = round2(totals.today_purchased);
+    totals.expired_remaining = round2(expired_remaining);
+    totals
 }
 
 fn credits_history_path(state: &crate::store::AppState) -> PathBuf {
@@ -286,6 +318,7 @@ pub fn record_daily_snapshot(
     state: &crate::store::AppState,
     rc: &RemainingCreditsFile,
     non_checkin_earned: f64,
+    expired_total: f64,
 ) {
     let today = fs_utils::today_prefix();
 
@@ -349,6 +382,7 @@ pub fn record_daily_snapshot(
         } else {
             Some(per_account_expire)
         },
+        expired: Some(round2(expired_total)),
     };
     if let Some(existing) = file.snapshots.iter_mut().find(|s| s.date == today) {
         // 同日重复刷新:整条重写(earned 由当日历史重新求和,不累加)
@@ -404,6 +438,7 @@ pub async fn refresh_remaining_credits(
     let mut ok_count = 0usize;
     let mut thawed_count = 0usize;
     let mut total_non_checkin_earned: f64 = 0.0;
+    let mut total_expired: f64 = 0.0;
 
     for a in &accounts {
         // 停用账号不参与统计:不发请求、不写 rc.credits、不进 per_account
@@ -417,7 +452,7 @@ pub async fn refresh_remaining_credits(
             continue;
         };
         match calc_remaining_credits(&jwt, client).await {
-            Ok((credits, expire_at, non_checkin_earned)) => {
+            Ok((credits, expire_at, non_checkin_earned, expired_remaining)) => {
                 let old = rc.credits.get(uid).copied().unwrap_or(0.0);
                 if should_keep_old_value(old, credits) {
                     // 疑似取数失败(会话失效会把余额写成 0):保留旧值,不计成功
@@ -432,6 +467,7 @@ pub async fn refresh_remaining_credits(
                     rc.expire_times.insert(uid.to_string(), exp);
                 }
                 total_non_checkin_earned += non_checkin_earned;
+                total_expired += expired_remaining;
                 ok_count += 1;
                 // 自动解冻:有积分 + 冷却类型非 SessionDead → 清除
                 if credits > 0.0 {
@@ -458,7 +494,7 @@ pub async fn refresh_remaining_credits(
 
     rc.updated_at = Some(fs_utils::now_iso());
     let _ = fs_utils::write_json(&state.data_path("remaining_credits.json"), &rc);
-    record_daily_snapshot(state, &rc, total_non_checkin_earned);
+    record_daily_snapshot(state, &rc, total_non_checkin_earned, total_expired);
 
     if thawed_count > 0 {
         fs_utils::app_log(
@@ -707,5 +743,49 @@ mod tests {
             compute_consumed(Some(&prev), &today, &HashMap::new(), 1000.0, 0.0);
         assert_eq!(consumed, 0.0, "停用号不得产生消耗");
         assert!(!legacy);
+    }
+
+    fn pack(limit: f64, used: f64, expire: Option<i64>) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "entitlement_base_info": {"quota": {"credits_limit": limit}},
+            "usage": {"credits_amount": used}
+        });
+        if let Some(exp) = expire {
+            v["expire_time"] = serde_json::json!(exp);
+        }
+        v
+    }
+
+    /// 3 个包:过期剩 100 / 有效剩 200 / 过期剩 0 → total=300、expired=100、earliest=有效包
+    #[test]
+    fn sum_packs_reports_expired_remaining_without_changing_total() {
+        let packs = vec![
+            pack(150.0, 50.0, Some(100)),  // 已过期,剩 100
+            pack(300.0, 100.0, Some(2000)), // 有效,剩 200
+            pack(80.0, 80.0, Some(300)),   // 已过期,剩 0
+        ];
+        let t = sum_packs(&packs, 1000, 0, 86_400);
+        assert_eq!(t.total, 300.0, "total 仍含过期包:100 + 200 + 0");
+        assert_eq!(t.expired_remaining, 100.0, "只有过期且有剩余的包计入虚账");
+        assert_eq!(t.earliest_expire, Some(2000), "earliest 只取未过期包");
+    }
+
+    /// 无 expire_time 的包 → 不计入 expired
+    #[test]
+    fn sum_packs_ignores_packs_without_expire_time() {
+        let packs = vec![pack(100.0, 0.0, None)];
+        let t = sum_packs(&packs, 1000, 0, 86_400);
+        assert_eq!(t.total, 100.0);
+        assert_eq!(t.expired_remaining, 0.0, "无 expire_time 不视为过期");
+        assert_eq!(t.earliest_expire, None);
+    }
+
+    /// expire <= now 但剩余为 0 → expired=0
+    #[test]
+    fn sum_packs_expired_with_zero_remaining_counts_zero() {
+        let packs = vec![pack(80.0, 80.0, Some(500))];
+        let t = sum_packs(&packs, 1000, 0, 86_400);
+        assert_eq!(t.total, 0.0);
+        assert_eq!(t.expired_remaining, 0.0, "剩余为 0 的过期包不计虚账");
     }
 }

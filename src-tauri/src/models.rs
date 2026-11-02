@@ -436,6 +436,9 @@ pub struct CreditsDailySnapshot {
     /// 当日各账号最早到期秒(uid -> 秒);旧快照读入为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_account_expire: Option<std::collections::BTreeMap<String, i64>>,
+    /// 当日各号「已过期未用额度」之和(TRAE 到期不扣余额,仍计入 total 的虚账);旧快照读入为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expired: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

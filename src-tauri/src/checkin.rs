@@ -810,7 +810,7 @@ pub async fn get_total_points(
         };
     };
     match crate::credits::calc_remaining_credits(&jwt, client).await {
-        Ok((credits, expire_at, _)) => {
+        Ok((credits, expire_at, _, _)) => {
             let mut rc: crate::models::RemainingCreditsFile =
                 crate::fs_utils::read_json(&state.data_path("remaining_credits.json"));
             rc.credits.insert(uid.to_string(), credits);

@@ -115,7 +115,33 @@ fn build_account_views(state: &AppState) -> Vec<PublicAccount> {
         .collect()
 }
 
-/// 只读判断:实例目录的 storage.json 里 iCubeAuthInfo 是否存在且非空(即客户端仍登着)
+/// storage.json 是否仍为登录态(纯函数,便于单测):
+/// - `iCubeAuthInfo://icube.cloudide` 非空 → 已登录
+/// - 或 存在任一非空 `iCubeAuthInfo://icube-dc:*` 且 `iCubeServerData://icube.cloudide` 是对象
+///   (TraeMate 启动写回 storage 后的形态,此时 cloudide 键会暂时消失)
+fn eval_storage_logged_in(value: &serde_json::Value) -> bool {
+    let cloudide_ok = value
+        .get("iCubeAuthInfo://icube.cloudide")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if cloudide_ok {
+        return true;
+    }
+    let dc_ok = value.as_object().map_or(false, |obj| {
+        obj.iter().any(|(k, v)| {
+            k.starts_with("iCubeAuthInfo://icube-dc:")
+                && v.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)
+        })
+    });
+    let server_data_ok = value
+        .get("iCubeServerData://icube.cloudide")
+        .map(|v| v.is_object())
+        .unwrap_or(false);
+    dc_ok && server_data_ok
+}
+
+/// 只读判断:实例目录的 storage.json 里是否仍是登录态
 fn instance_logged_in(data_dir: Option<&str>) -> Option<bool> {
     let dir = data_dir?;
     let path = std::path::Path::new(dir)
@@ -124,13 +150,7 @@ fn instance_logged_in(data_dir: Option<&str>) -> Option<bool> {
         .join("storage.json");
     let text = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    // 键名实测为 iCubeAuthInfo://icube.cloudide(部分版本曾写作 cube.cloudide,已确认为无效键)
-    let ok = value
-        .get("iCubeAuthInfo://icube.cloudide")
-        .and_then(|v| v.as_str())
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    Some(ok)
+    Some(eval_storage_logged_in(&value))
 }
 
 /// 导入当前 TRAE 桌面账号:读取桌面凭据 -> DPAPI 加密 -> upsert 存储
@@ -459,7 +479,7 @@ pub async fn fetch_remaining_credits(
         find_by_user_id(&state, &user_id).ok_or_else(|| AppError::NotFound(user_id.clone()))?;
     let jwt = crate::credits::resolve_account_jwt(&account)
         .ok_or_else(|| AppError::Credential("账号无可用凭据".into()))?;
-    let (credits, expire_at, _) =
+    let (credits, expire_at, _, _) =
         crate::credits::calc_remaining_credits(&jwt, client.inner())
             .await
             .map_err(AppError::Credential)?;
@@ -521,12 +541,13 @@ pub fn credits_export_csv(state: State<'_, AppState>) -> AppResult<Vec<String>> 
     let mut snaps = file.snapshots.clone();
     snaps.sort_by(|a, b| a.date.cmp(&b.date));
 
-    let mut csv_daily =
-        String::from("date,total,earned,earned_observed,earned_gap,consumed,legacy\r\n");
+    let mut csv_daily = String::from(
+        "date,total,earned,earned_observed,earned_gap,expired,consumed,legacy\r\n",
+    );
     for s in &snaps {
         // 旧数据(无 per_account)一律视为旧算法算出
         let legacy = s.consumed_legacy || s.per_account.is_none();
-        // 旧行没有观测入账/缺口字段:按空值输出,不做回填推算
+        // 旧行没有观测入账/缺口/过期额度字段:按空值输出,不做回填推算
         let observed = s
             .earned_observed
             .map(|v| format!("{v:.2}"))
@@ -535,13 +556,15 @@ pub fn credits_export_csv(state: State<'_, AppState>) -> AppResult<Vec<String>> 
             (Some(r), Some(o)) => format!("{:.2}", crate::credits::earned_gap(r, o)),
             _ => String::new(),
         };
+        let expired = s.expired.map(|v| format!("{v:.2}")).unwrap_or_default();
         csv_daily.push_str(&format!(
-            "{},{},{},{},{},{},{}\r\n",
+            "{},{},{},{},{},{},{},{}\r\n",
             s.date,
             format!("{:.2}", s.total),
             format!("{:.2}", s.earned),
             observed,
             gap,
+            expired,
             format!("{:.2}", s.consumed),
             if legacy { "true" } else { "false" }
         ));
@@ -1918,5 +1941,38 @@ mod tests {
         }
         assert!(!used.contains("MID-IN-OTHER"), "无关目录不得收集");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A42①:只有 cloudide 键 → 已登录
+    #[test]
+    fn eval_logged_in_accepts_cloudide() {
+        let v = serde_json::json!({"iCubeAuthInfo://icube.cloudide": "opaque-credential"});
+        assert!(eval_storage_logged_in(&v));
+    }
+
+    /// A42②:无 cloudide,但有 icube-dc:* 且有 ServerData 对象 → 已登录(启动写回形态)
+    #[test]
+    fn eval_logged_in_accepts_dc_with_server_data() {
+        let v = serde_json::json!({
+            "iCubeAuthInfo://icube-dc:76337145789456": "dc-payload",
+            "iCubeServerData://icube.cloudide": {"region": "CN"}
+        });
+        assert!(eval_storage_logged_in(&v));
+    }
+
+    /// A42③:无 cloudide,有 icube-dc:* 但无 ServerData → 未登录(死号)
+    #[test]
+    fn eval_logged_in_rejects_dc_without_server_data() {
+        let v = serde_json::json!({"iCubeAuthInfo://icube-dc:76337145789456": "dc-payload"});
+        assert!(!eval_storage_logged_in(&v));
+    }
+
+    /// A42④:空字符串 / 空对象 → 未登录
+    #[test]
+    fn eval_logged_in_rejects_empty_values() {
+        assert!(!eval_storage_logged_in(&serde_json::json!({})));
+        assert!(!eval_storage_logged_in(
+            &serde_json::json!({"iCubeAuthInfo://icube.cloudide": ""})
+        ));
     }
 }
