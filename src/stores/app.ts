@@ -222,7 +222,13 @@ export const useAppStore = defineStore('app', () => {
       const result = await invoke<CheckinResult>('checkin_account', { id })
       await fetchAccounts()
       await fetchLogs()
+      await fetchCreditsDaily()
       return result
+    } catch (e) {
+      // 失败也重拉一次,保证卡片与看板跟实际一致
+      await fetchAccounts()
+      await fetchCreditsDaily()
+      throw e
     } finally {
       checkingIn.value = false
       checkingIds.delete(id)
@@ -235,7 +241,13 @@ export const useAppStore = defineStore('app', () => {
       const result = await invoke<Array<[Account, CheckinResult]>>('checkin_all')
       await fetchAccounts()
       await fetchLogs()
+      await fetchCreditsDaily()
       return result
+    } catch (e) {
+      // 失败也重拉一次,保证卡片与看板跟实际一致
+      await fetchAccounts()
+      await fetchCreditsDaily()
+      throw e
     } finally {
       checkingIn.value = false
     }

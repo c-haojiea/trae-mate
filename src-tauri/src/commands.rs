@@ -262,7 +262,13 @@ pub async fn checkin_account(
         data.get_accounts().iter().find(|a| a.id == id).cloned()
     };
     let account = account.ok_or_else(|| AppError::NotFound(id.clone()))?;
-    Ok(checkin::perform_checkin(Some(&app), &account, client.inner(), state.inner()).await)
+    let result =
+        checkin::perform_checkin(Some(&app), &account, client.inner(), state.inner()).await;
+    // 签到成功即重算当日快照(写 remaining + 快照 + 自动解冻),避免看板「新增」滞后
+    if result.success {
+        let _ = crate::credits::refresh_remaining_credits(state.inner(), client.inner()).await;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -273,9 +279,14 @@ pub async fn checkin_all(
 ) -> AppResult<Vec<(PublicAccount, CheckinResult)>> {
     // 手动一键签到:账号间保持 2s 快速执行(自动定时签到用可配置的分钟级间隔,见 scheduler)
     // 手动不跳过当天已签账号,保证用户主动点击时能看到每个账号的真实状态
-    checkin::perform_all_checkin(&app, client.inner(), state.inner(), 2, false)
+    let results = checkin::perform_all_checkin(&app, client.inner(), state.inner(), 2, false)
         .await
-        .map_err(AppError::Launch)
+        .map_err(AppError::Launch)?;
+    // 有任一账号签到成功才重算当日快照,让看板「今日新增」无需手动刷新即跟随
+    if results.iter().any(|(_, r)| r.success) {
+        let _ = crate::credits::refresh_remaining_credits(state.inner(), client.inner()).await;
+    }
+    Ok(results)
 }
 
 #[tauri::command]
@@ -454,6 +465,15 @@ pub async fn fetch_remaining_credits(
             .map_err(AppError::Credential)?;
     let mut rc: crate::models::RemainingCreditsFile =
         crate::fs_utils::read_json(&state.data_path("remaining_credits.json"));
+    let old = rc.credits.get(&user_id).copied().unwrap_or(0.0);
+    if crate::credits::should_keep_old_value(old, credits) {
+        // 疑似取数失败(会话失效会把余额写成 0):保留旧值,不回写缓存
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("疑似取数失败,保留旧值 uid={user_id} 旧={old:.2} 新=0"),
+        );
+        return Ok(old);
+    }
     rc.credits.insert(user_id.clone(), credits);
     if let Some(exp) = expire_at {
         rc.expire_times.insert(user_id.clone(), exp);

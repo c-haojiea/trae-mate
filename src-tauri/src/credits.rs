@@ -254,7 +254,30 @@ pub fn earned_gap(recorded: f64, observed: f64) -> f64 {
     round2((observed - recorded).max(0.0))
 }
 
-/// 记录每日积分快照(每天计算一次):total=所有账号剩余积分之和;
+/// 是否保留本地旧值:接口返回 0 而本地已有正值 → 视为疑似取数失败。
+/// 真实下降(new > 0 且小于 old)与真实清零(old == 0)都不受影响。
+pub fn should_keep_old_value(old: f64, new: f64) -> bool {
+    new == 0.0 && old > 0.0
+}
+
+/// 当日 per_account:剔除停用账号的 uid(rc.credits 原样保留,不删不改)。
+fn enabled_today_map(
+    credits: &std::collections::HashMap<String, f64>,
+    disabled: &std::collections::HashSet<String>,
+) -> std::collections::BTreeMap<String, f64> {
+    credits
+        .iter()
+        .filter(|(uid, _)| !disabled.contains(*uid))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
+}
+
+/// 快照 total 与 per_account 同源:只用启用号余额合计。
+fn snapshot_total(per_account: &std::collections::BTreeMap<String, f64>) -> f64 {
+    round2(per_account.values().sum())
+}
+
+/// 记录每日积分快照(每天计算一次):total=启用账号余额合计(与 per_account 同源);
 /// earned=今日签到获得(delta 之和)+ 购买获得;
 /// consumed 优先按账号求和(见 compute_consumed),昨日缺 per_account 时退回旧公式并标 legacy。
 /// earned_recorded=earned(本应用记录入账);earned_observed=余额观测入账(新号排除);
@@ -265,7 +288,6 @@ pub fn record_daily_snapshot(
     non_checkin_earned: f64,
 ) {
     let today = fs_utils::today_prefix();
-    let total = round2(rc.credits.values().sum());
 
     let mut file: CreditsDailyFile = fs_utils::read_json(&state.data_path("credits_daily.json"));
 
@@ -282,8 +304,20 @@ pub fn record_daily_snapshot(
     }
     let earned = round2(checkin_earned + non_checkin_earned);
 
-    let today_map: std::collections::BTreeMap<String, f64> =
-        rc.credits.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let today_map: std::collections::BTreeMap<String, f64> = {
+        // 停用账号不参与统计:从当日 per_account 剔除(旧值仍保留在 remaining_credits.json 里,不删除)
+        let disabled: std::collections::HashSet<String> = {
+            let data = state.data.lock().unwrap();
+            data.get_accounts()
+                .iter()
+                .filter(|a| !a.enabled)
+                .filter_map(|a| crate::store::effective_user_id(a).map(str::to_string))
+                .collect()
+        };
+        enabled_today_map(&rc.credits, &disabled)
+    };
+    // total 与 per_account 同源:只用启用号合计,避免停用号余额把「当前总余额」抬高到与明细对不上
+    let total = snapshot_total(&today_map);
     let prev = file
         .snapshots
         .iter()
@@ -372,6 +406,10 @@ pub async fn refresh_remaining_credits(
     let mut total_non_checkin_earned: f64 = 0.0;
 
     for a in &accounts {
+        // 停用账号不参与统计:不发请求、不写 rc.credits、不进 per_account
+        if !a.enabled {
+            continue;
+        }
         let Some(uid) = crate::store::effective_user_id(a) else {
             continue;
         };
@@ -380,6 +418,15 @@ pub async fn refresh_remaining_credits(
         };
         match calc_remaining_credits(&jwt, client).await {
             Ok((credits, expire_at, non_checkin_earned)) => {
+                let old = rc.credits.get(uid).copied().unwrap_or(0.0);
+                if should_keep_old_value(old, credits) {
+                    // 疑似取数失败(会话失效会把余额写成 0):保留旧值,不计成功
+                    fs_utils::app_log(
+                        &state.data_dir,
+                        &format!("疑似取数失败,保留旧值 uid={uid} 旧={old:.2} 新=0"),
+                    );
+                    continue;
+                }
                 rc.credits.insert(uid.to_string(), credits);
                 if let Some(exp) = expire_at {
                     rc.expire_times.insert(uid.to_string(), exp);
@@ -563,5 +610,102 @@ mod tests {
         assert_eq!(observed, 300.0);
         assert!(earned_gap(0.0, observed) > 0.0, "未记录的正向入账必须暴露为缺口");
         assert!(earned_gap(0.0, observed) <= observed, "缺口不得超过观测入账");
+    }
+
+    /// 可疑 0:本地有正值、接口回 0 才保留;真实下降与真实清零均照常处理
+    #[test]
+    fn keep_old_value_only_for_suspicious_zero() {
+        assert!(
+            should_keep_old_value(449.18, 0.0),
+            "旧值 > 0 且新值 = 0 必须保留旧值"
+        );
+        assert!(!should_keep_old_value(0.0, 0.0), "真实清零照常写入");
+        assert!(
+            !should_keep_old_value(449.18, 21.0),
+            "真实下降(new>0)不得被吞掉"
+        );
+        assert!(!should_keep_old_value(0.0, 100.0), "正常新增不得被拦");
+    }
+
+    /// 停用号不再刷新 → 今日 per_account 缺该 uid → compute_consumed 必须跳过
+    #[test]
+    fn disabled_account_missing_today_produces_no_consumed() {
+        let prev = CreditsDailySnapshot {
+            date: "2026-11-01".into(),
+            total: 449.18,
+            earned: 0.0,
+            consumed: 0.0,
+            per_account: Some(balances(&[("a", 449.18)])),
+            consumed_legacy: false,
+            ..Default::default()
+        };
+        let today = balances(&[]);
+
+        let (consumed, legacy) =
+            compute_consumed(Some(&prev), &today, &HashMap::new(), 0.0, 0.0);
+        assert_eq!(consumed, 0.0, "缺今日值的 uid 必须跳过,不得按昨日余额算消耗");
+        assert!(!legacy);
+    }
+
+    /// 可疑 0 被保留后(今日余额与昨日相同),次日快照不得凭空产生消耗
+    #[test]
+    fn kept_old_value_yields_zero_consumed() {
+        let prev = CreditsDailySnapshot {
+            date: "2026-11-01".into(),
+            total: 449.18,
+            earned: 0.0,
+            consumed: 0.0,
+            per_account: Some(balances(&[("a", 449.18)])),
+            consumed_legacy: false,
+            ..Default::default()
+        };
+        let today = balances(&[("a", 449.18)]);
+
+        let (consumed, legacy) =
+            compute_consumed(Some(&prev), &today, &HashMap::new(), 449.18, 0.0);
+        assert_eq!(consumed, 0.0, "余额持平且无入账,消耗必须为 0");
+        assert!(!legacy);
+    }
+
+    /// 停用号不参与 total 与 per_account:total 必须与明细逐分同源
+    #[test]
+    fn disabled_account_excluded_from_total_and_per_account() {
+        let credits: HashMap<String, f64> = [
+            ("off".to_string(), 500.0),
+            ("on".to_string(), 1000.0),
+        ]
+        .into_iter()
+        .collect();
+        let disabled: std::collections::HashSet<String> =
+            std::collections::HashSet::from(["off".to_string()]);
+
+        let today = enabled_today_map(&credits, &disabled);
+        assert_eq!(today.len(), 1, "只保留启用号");
+        assert_eq!(today.get("on"), Some(&1000.0));
+        assert!(today.get("off").is_none(), "停用号必须从 per_account 剔除");
+        assert_eq!(
+            snapshot_total(&today),
+            1000.0,
+            "total 必须等于 per_account 各值之和(不含停用号 500)"
+        );
+        assert_eq!(
+            snapshot_total(&today),
+            round2(today.values().sum::<f64>()),
+            "total 与明细逐分一致"
+        );
+
+        let prev = CreditsDailySnapshot {
+            date: "2026-11-01".into(),
+            total: 1500.0,
+            earned: 0.0,
+            consumed: 0.0,
+            per_account: Some(balances(&[("off", 500.0), ("on", 1000.0)])),
+            consumed_legacy: false,
+            ..Default::default()
+        };
+        let (consumed, legacy) =
+            compute_consumed(Some(&prev), &today, &HashMap::new(), 1000.0, 0.0);
+        assert_eq!(consumed, 0.0, "停用号不得产生消耗");
+        assert!(!legacy);
     }
 }
