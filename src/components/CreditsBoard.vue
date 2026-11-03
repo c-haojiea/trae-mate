@@ -276,8 +276,8 @@ async function handleRefresh() {
   if (refreshing.value) return
   refreshing.value = true
   try {
+    // refreshAllCredits 内部已 await fetchAccounts() + fetchCreditsDaily(),此处不再重复
     await store.refreshAllCredits()
-    await Promise.all([store.fetchCreditsDaily(), store.fetchAccounts()])
   } finally {
     refreshing.value = false
   }

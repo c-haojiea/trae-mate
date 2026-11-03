@@ -127,6 +127,10 @@ export interface AppSettings {
   notifyOnSuccess: boolean
   notifyOnFailed: boolean
   launchAtLogin: boolean
+  /** 每日自动积分快照:到点自动刷新余额并重写当日快照 */
+  creditsSnapshotEnabled: boolean
+  /** 自动快照时间 "HH:mm" */
+  creditsSnapshotTime: string
   // 以下字段为兼容旧 UI(已隐藏),desktop 模式下后端不再使用
   checkinMode?: 'webview' | 'api'
   apiConfig?: {

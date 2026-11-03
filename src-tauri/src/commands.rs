@@ -710,6 +710,14 @@ pub fn save_settings(
             ));
         }
     }
+    // 自动快照时间同样严格校验:非法值不写盘、不重启调度
+    if let Some(t) = settings.credits_snapshot_time.as_deref() {
+        if !scheduler::validate_hhmm(t) {
+            return Err(AppError::Launch(
+                "自动快照时间格式无效,应为 HH:MM(00:00-23:59)".into(),
+            ));
+        }
+    }
     let mut data = state.data.lock().unwrap();
     let s = data.save_settings(settings);
     data.save(&state.path)?;

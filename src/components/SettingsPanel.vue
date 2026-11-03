@@ -263,6 +263,32 @@
 
       <div class="setting-item">
         <div class="setting-info">
+          <span class="setting-label">每日自动快照</span>
+          <span class="setting-desc">到点自动刷新余额并重写当日快照，解决跨零点消耗归因（需应用保持运行）</span>
+        </div>
+        <div
+          class="switch"
+          :class="{ active: store.settings?.creditsSnapshotEnabled }"
+          @click="toggleCreditsSnapshot"
+        ></div>
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
+          <span class="setting-label">快照时间</span>
+          <span class="setting-desc">每天自动重写当日快照的时间（默认 23:55）</span>
+        </div>
+        <input
+          type="time"
+          class="input time-input"
+          :value="store.settings?.creditsSnapshotTime"
+          @change="updateCreditsSnapshotTime"
+          :disabled="!store.settings?.creditsSnapshotEnabled"
+        />
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-info">
           <span class="setting-label">清空所有冷却</span>
           <span class="setting-desc">重置全部账号的签到错误冷却状态(SessionDead 永久冷却除外需重新登录)</span>
         </div>
@@ -452,6 +478,16 @@ async function toggleAutoCheckin() {
 async function updateCheckinTime(e: Event) {
   const value = (e.target as HTMLInputElement).value
   await store.saveSettings({ checkinTime: value })
+}
+
+async function toggleCreditsSnapshot() {
+  if (!store.settings) return
+  await store.saveSettings({ creditsSnapshotEnabled: !store.settings.creditsSnapshotEnabled })
+}
+
+async function updateCreditsSnapshotTime(e: Event) {
+  const value = (e.target as HTMLInputElement).value
+  await store.saveSettings({ creditsSnapshotTime: value })
 }
 
 async function updateCheckinInterval(e: Event) {

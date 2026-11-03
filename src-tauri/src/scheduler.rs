@@ -51,6 +51,12 @@ pub fn start_scheduler(app: AppHandle) {
         .lock()
         .unwrap()
         .get_settings();
+
+    // 每日自动快照:独立循环,自动签到关掉时也必须能跑
+    if settings.credits_snapshot_enabled && parse_hhmm(&settings.credits_snapshot_time).is_some() {
+        spawn_snapshot_loop(app.clone(), my_gen, cancel.clone());
+    }
+
     if !settings.auto_checkin {
         return;
     }
@@ -91,6 +97,82 @@ pub fn start_scheduler(app: AppHandle) {
                     }
                 }
             }
+        }
+    });
+}
+
+/// 每日自动积分快照循环:到点刷新余额并重写当日快照,解决跨零点消耗归因。
+/// 与签到循环共用 generation/cancel,互不影响;开关关闭时自然退出,改设置会重起。
+fn spawn_snapshot_loop(app: AppHandle, my_gen: u64, cancel: Arc<AtomicBool>) {
+    tauri::async_runtime::spawn(async move {
+        // 已触发自动快照的日期:同一分钟内只跑一次,避免整分钟重复触发
+        let mut last_run_day: Option<chrono::NaiveDate> = None;
+        loop {
+            if !is_current(&app, my_gen) {
+                break;
+            }
+            let settings = {
+                app.state::<AppState>()
+                    .inner()
+                    .data
+                    .lock()
+                    .unwrap()
+                    .get_settings()
+            };
+            if !settings.credits_snapshot_enabled {
+                break;
+            }
+            let Some((h, m)) = parse_hhmm(&settings.credits_snapshot_time) else {
+                // 时间非法(配置损坏):10 分钟后重试,改好设置自愈
+                if !sleep_interruptible(&cancel, Duration::from_secs(600)).await {
+                    break;
+                }
+                continue;
+            };
+            let now = chrono::Utc::now().with_timezone(&Shanghai);
+            let dur = if due_now(&now, (h, m), last_run_day) {
+                Duration::from_secs(0)
+            } else {
+                match next_daily_instant(now, (h, m)) {
+                    Some(next) => (next - chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or(Duration::from_secs(600)),
+                    None => Duration::from_secs(600),
+                }
+            };
+            if !sleep_interruptible(&cancel, dur).await {
+                break;
+            }
+            if !is_current(&app, my_gen) {
+                break;
+            }
+            // 睡眠期间可能被关掉开关
+            let enabled_now = {
+                app.state::<AppState>()
+                    .inner()
+                    .data
+                    .lock()
+                    .unwrap()
+                    .get_settings()
+                    .credits_snapshot_enabled
+            };
+            if !enabled_now {
+                break;
+            }
+            let state = app.state::<AppState>();
+            let client = app.state::<reqwest::Client>();
+            match crate::credits::refresh_remaining_credits(state.inner(), client.inner()).await {
+                Ok(n) => crate::fs_utils::app_log(
+                    &state.inner().data_dir,
+                    &format!("自动积分快照: 刷新成功 {n} 个账号"),
+                ),
+                Err(e) => crate::fs_utils::app_log(
+                    &state.inner().data_dir,
+                    &format!("自动积分快照失败: {e}"),
+                ),
+            }
+            // Ok/Err 都算本次已尝试:记录实际触发日,防止同一分钟重复触发
+            last_run_day = Some(today_shanghai());
         }
     });
 }
@@ -150,6 +232,7 @@ fn past_scheduled_time(now: chrono::DateTime<chrono_tz::Tz>, (h, m): (u32, u32))
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use chrono::Timelike;
 
     #[test]
     fn past_scheduled_time_boundaries() {
@@ -194,6 +277,67 @@ mod tests {
         assert_eq!(next_action(true, 3, true), Plan::SleepToNextDay, "达上限不再重试");
         assert_eq!(next_action(true, 1, false), Plan::SleepToNextDay, "无未签账号不再重试");
         assert_eq!(next_action(false, 0, true), Plan::SleepToNextDay, "未到点睡到明天");
+    }
+
+    #[test]
+    fn next_daily_instant_today_or_tomorrow() {
+        let tz = shanghai_tz();
+        let at = |h, m| tz.with_ymd_and_hms(2026, 11, 3, h, m, 0).unwrap();
+
+        // 未到点 → 当天
+        let n1 = next_daily_instant(at(10, 0), (23, 55)).unwrap();
+        let l1 = n1.with_timezone(&tz);
+        assert_eq!(l1.date_naive(), at(10, 0).date_naive(), "未到点应落在当天");
+        assert_eq!((l1.hour(), l1.minute()), (23, 55));
+
+        // 正好同一分钟 → 视为已过,落到明天(判定条件是 >)
+        let n2 = next_daily_instant(at(23, 55), (23, 55)).unwrap();
+        let l2 = n2.with_timezone(&tz);
+        assert_eq!(
+            l2.date_naive(),
+            at(10, 0).date_naive() + chrono::Duration::days(1),
+            "同一分钟按 > 判定,落到明天"
+        );
+
+        // 已过点 → 明天
+        let n3 = next_daily_instant(at(23, 56), (23, 55)).unwrap();
+        let l3 = n3.with_timezone(&tz);
+        assert_eq!(l3.date_naive(), at(10, 0).date_naive() + chrono::Duration::days(1));
+        assert_eq!((l3.hour(), l3.minute()), (23, 55));
+    }
+
+    #[test]
+    fn in_scheduled_minute_boundaries() {
+        let tz = shanghai_tz();
+        let at = |h, m| tz.with_ymd_and_hms(2026, 11, 3, h, m, 0).unwrap();
+        assert!(in_scheduled_minute(&at(10, 14), (10, 14)), "同一分钟命中");
+        assert!(!in_scheduled_minute(&at(10, 13), (10, 14)), "前一分钟不命中");
+        assert!(!in_scheduled_minute(&at(10, 15), (10, 14)), "后一分钟不命中");
+        assert!(!in_scheduled_minute(&at(9, 14), (10, 14)), "同一分钟数不同小时不命中");
+    }
+
+    #[test]
+    fn due_now_same_minute_runs_once() {
+        let tz = shanghai_tz();
+        let at = |h, m| tz.with_ymd_and_hms(2026, 11, 3, h, m, 0).unwrap();
+        let day = at(10, 14).date_naive();
+
+        // 同一分钟,从未跑过 → 立即执行
+        assert!(due_now(&at(10, 14), (10, 14), None));
+        // 同一分钟,今天已跑过 → 不再触发(防整分钟重复循环)
+        assert!(!due_now(&at(10, 14), (10, 14), Some(day)));
+        // 下一分钟,今天已跑过 → 不触发,且 next_daily_instant 落到明天
+        assert!(!due_now(&at(10, 15), (10, 14), Some(day)));
+        let next = next_daily_instant(at(10, 15), (10, 14)).unwrap();
+        let local = next.with_timezone(&tz);
+        assert_eq!(
+            local.date_naive(),
+            day + chrono::Duration::days(1),
+            "同一分钟过后必须睡到明天"
+        );
+        // 次日同一分钟 → 允许再次执行
+        let next_day_at = tz.with_ymd_and_hms(2026, 11, 4, 10, 14, 0).unwrap();
+        assert!(due_now(&next_day_at, (10, 14), Some(day)));
     }
 
     fn shanghai_tz() -> chrono_tz::Tz {
@@ -284,6 +428,14 @@ async fn run_auto_checkin(app: AppHandle) {
 fn next_run_instant(settings: &AppSettings) -> Option<chrono::DateTime<chrono::Utc>> {
     let (h, m) = parse_hhmm(&settings.checkin_time)?;
     let now = chrono::Utc::now().with_timezone(&Shanghai);
+    next_daily_instant(now, (h, m))
+}
+
+/// 下一个每日时刻(上海时区):未到点=当天,已过点(含同一分钟)=明天
+fn next_daily_instant(
+    now: chrono::DateTime<chrono_tz::Tz>,
+    (h, m): (u32, u32),
+) -> Option<chrono::DateTime<chrono::Utc>> {
     let today = now.date_naive().and_hms_opt(h, m, 0)?;
     let today = today.and_local_timezone(Shanghai).single()?;
     let next = if today > now {
@@ -292,6 +444,20 @@ fn next_run_instant(settings: &AppSettings) -> Option<chrono::DateTime<chrono::U
         today + chrono::Duration::days(1)
     };
     Some(next.with_timezone(&chrono::Utc))
+}
+
+/// 当前时刻是否正落在设定的那一分钟(启动时恰好到点,不能漏当天)
+fn in_scheduled_minute(now: &chrono::DateTime<chrono_tz::Tz>, (h, m): (u32, u32)) -> bool {
+    now.hour() as u32 == h && now.minute() as u32 == m
+}
+
+/// 是否应立即执行快照:命中目标分钟,且当天尚未触发过(同分钟只跑一次)
+fn due_now(
+    now: &chrono::DateTime<chrono_tz::Tz>,
+    (h, m): (u32, u32),
+    last_run: Option<chrono::NaiveDate>,
+) -> bool {
+    in_scheduled_minute(now, (h, m)) && last_run != Some(now.date_naive())
 }
 
 fn next_run_duration(app: &AppHandle) -> Option<std::time::Duration> {

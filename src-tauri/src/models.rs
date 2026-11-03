@@ -184,10 +184,24 @@ pub struct AppSettings {
     pub notify_on_success: bool,
     pub notify_on_failed: bool,
     pub launch_at_login: bool,
+    /// 每日自动积分快照:到点自动刷新余额并重写当日快照,解决跨零点消耗归因
+    #[serde(default = "default_snapshot_enabled")]
+    pub credits_snapshot_enabled: bool,
+    /// 自动快照时间 "HH:mm",默认 23:55
+    #[serde(default = "default_snapshot_time")]
+    pub credits_snapshot_time: String,
 }
 
 fn default_checkin_interval() -> u32 {
     15
+}
+
+fn default_snapshot_enabled() -> bool {
+    true
+}
+
+fn default_snapshot_time() -> String {
+    "23:55".into()
 }
 
 impl Default for AppSettings {
@@ -201,6 +215,8 @@ impl Default for AppSettings {
             notify_on_success: true,
             notify_on_failed: true,
             launch_at_login: false,
+            credits_snapshot_enabled: true,
+            credits_snapshot_time: "23:55".into(),
         }
     }
 }
@@ -225,6 +241,10 @@ pub struct PartialAppSettings {
     pub notify_on_failed: Option<bool>,
     #[serde(default)]
     pub launch_at_login: Option<bool>,
+    #[serde(default)]
+    pub credits_snapshot_enabled: Option<bool>,
+    #[serde(default)]
+    pub credits_snapshot_time: Option<String>,
 }
 
 impl AppSettings {
@@ -254,6 +274,13 @@ impl AppSettings {
         }
         if let Some(v) = p.launch_at_login {
             self.launch_at_login = v;
+        }
+        if let Some(v) = p.credits_snapshot_enabled {
+            self.credits_snapshot_enabled = v;
+        }
+        if let Some(v) = p.credits_snapshot_time {
+            // 合法性统一在命令层校验,这里原样写入
+            self.credits_snapshot_time = v;
         }
     }
 }
@@ -471,4 +498,42 @@ pub struct RemainingCreditsFile {
     pub expire_times: HashMap<String, i64>,
     #[serde(default)]
     pub updated_at: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 向后兼容命门:现网旧 settings(无快照字段)读入后必须拿到默认值
+    #[test]
+    fn legacy_settings_get_snapshot_defaults() {
+        let legacy = r#"{"autoCheckin":true,"checkinTime":"08:03","retryCount":3,"retryDelay":60,"autoCheckinIntervalMin":10,"notifyOnSuccess":true,"notifyOnFailed":true,"launchAtLogin":false}"#;
+        let s: AppSettings = serde_json::from_str(legacy).unwrap();
+        assert!(s.credits_snapshot_enabled, "默认开启自动快照");
+        assert_eq!(s.credits_snapshot_time, "23:55", "默认 23:55");
+        assert_eq!(s.checkin_time, "08:03", "旧字段照常解析");
+    }
+
+    /// 只传快照时间时:只改时间,不动开关
+    #[test]
+    fn partial_settings_time_only_keeps_switch() {
+        let mut s = AppSettings::default();
+        s.credits_snapshot_enabled = false;
+        let p: PartialAppSettings =
+            serde_json::from_str(r#"{"creditsSnapshotTime":"21:30"}"#).unwrap();
+        s.merge(p);
+        assert!(!s.credits_snapshot_enabled, "只传时间不得改动开关");
+        assert_eq!(s.credits_snapshot_time, "21:30");
+    }
+
+    /// 只传开关时:时间保持原值
+    #[test]
+    fn partial_settings_switch_only_keeps_time() {
+        let mut s = AppSettings::default();
+        let p: PartialAppSettings =
+            serde_json::from_str(r#"{"creditsSnapshotEnabled":false}"#).unwrap();
+        s.merge(p);
+        assert!(!s.credits_snapshot_enabled);
+        assert_eq!(s.credits_snapshot_time, "23:55", "只传开关不得改动时间");
+    }
 }
