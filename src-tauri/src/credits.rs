@@ -221,19 +221,8 @@ fn compute_consumed(
     let prev_total = prev.map(|p| p.total).unwrap_or(0.0);
     if let Some(prev_map) = prev.and_then(|p| p.per_account.as_ref()) {
         if !prev_map.is_empty() {
-            let mut consumed = 0.0f64;
-            for (uid, prev_i) in prev_map {
-                let Some(today_i) = today.get(uid) else {
-                    continue;
-                };
-                // 余额为 0 的号即使签到记录 delta>0,也没有真实余额流动,不计消耗
-                if *prev_i <= 0.0 && *today_i <= 0.0 {
-                    continue;
-                }
-                let earned_i = earned_by_uid.get(uid).copied().unwrap_or(0.0);
-                consumed += (prev_i + earned_i - today_i).max(0.0);
-            }
-            return (round2(consumed), false);
+            let by_uid = consumed_by_uid(prev_map, today, earned_by_uid);
+            return (round2(by_uid.values().sum()), false);
         }
     }
     // 昨日无个体余额(历史数据):退回旧公式,并标记该条由旧算法得出
@@ -241,6 +230,32 @@ fn compute_consumed(
         round2((merged_total - merged_earned - prev_total).abs()),
         true,
     )
+}
+
+/// 逐账号消耗(规则与 compute_consumed 完全一致,供看板明细复用):
+/// 只遍历昨日存在的 uid;prev<=0 且 today<=0 跳过;
+/// consumed_i = max(0, 昨日余额 + 今日该号入账 − 今日余额),逐号 round2。
+pub fn consumed_by_uid(
+    prev_per: &std::collections::BTreeMap<String, f64>,
+    today_per: &std::collections::BTreeMap<String, f64>,
+    earned_by_uid: &std::collections::HashMap<String, f64>,
+) -> std::collections::BTreeMap<String, f64> {
+    let mut out: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    for (uid, prev_i) in prev_per {
+        let Some(today_i) = today_per.get(uid) else {
+            continue;
+        };
+        // 余额为 0 的号即使签到记录 delta>0,也没有真实余额流动,不计消耗
+        if *prev_i <= 0.0 && *today_i <= 0.0 {
+            continue;
+        }
+        let earned_i = earned_by_uid.get(uid).copied().unwrap_or(0.0);
+        out.insert(
+            uid.clone(),
+            round2((prev_i + earned_i - today_i).max(0.0)),
+        );
+    }
+    out
 }
 
 /// 余额观测入账:昨日已存在账号的 max(0, 今日余额 − 昨日余额) 之和。
@@ -787,5 +802,43 @@ mod tests {
         let t = sum_packs(&packs, 1000, 0, 86_400);
         assert_eq!(t.total, 0.0);
         assert_eq!(t.expired_remaining, 0.0, "剩余为 0 的过期包不计虚账");
+    }
+
+    /// 逐号消耗:持平为 0、真实下降计 100,且与 compute_consumed 求和一致
+    #[test]
+    fn consumed_by_uid_reports_per_account_drops() {
+        let prev = balances(&[("a", 449.18), ("b", 100.0)]);
+        let today = balances(&[("a", 449.18), ("b", 0.0)]);
+
+        let by_uid = consumed_by_uid(&prev, &today, &HashMap::new());
+        assert_eq!(by_uid.get("a"), Some(&0.0), "余额持平不产生消耗");
+        assert_eq!(by_uid.get("b"), Some(&100.0), "真实下降计为消耗");
+        assert_eq!(by_uid.len(), 2);
+
+        let prev_snap = CreditsDailySnapshot {
+            date: "2026-11-02".into(),
+            total: 549.18,
+            earned: 0.0,
+            consumed: 0.0,
+            per_account: Some(prev),
+            consumed_legacy: false,
+            ..Default::default()
+        };
+        let (consumed, legacy) =
+            compute_consumed(Some(&prev_snap), &today, &HashMap::new(), 449.18, 0.0);
+        assert_eq!(consumed, 100.0, "逐号求和必须等于汇总消耗");
+        assert!(!legacy);
+    }
+
+    /// 正增量不产生消耗(即使有签到入账,余额净增仍钳到 0)
+    #[test]
+    fn consumed_by_uid_ignores_positive_gain() {
+        let prev = balances(&[("a", 100.0)]);
+        let today = balances(&[("a", 700.0)]);
+        let earned: HashMap<String, f64> = [("a".to_string(), 100.0)].into_iter().collect();
+
+        let by_uid = consumed_by_uid(&prev, &today, &earned);
+        assert_eq!(by_uid.get("a"), Some(&0.0), "余额净增时消耗必须为 0");
+        assert_eq!(by_uid.values().sum::<f64>(), 0.0);
     }
 }

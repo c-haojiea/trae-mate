@@ -516,15 +516,51 @@ pub async fn refresh_all_remaining_credits(
 
 /// 每日积分快照列表(积分看板三线趋势数据源)
 /// 同时返回 remaining_credits.json 的 updated_at,供前端显示「数据截至」
+/// 以及当日逐账号消耗 consumedByUidToday(口径与 compute_consumed 完全一致)
 #[tauri::command]
 pub fn credits_daily_list(state: State<'_, AppState>) -> serde_json::Value {
     let file: crate::models::CreditsDailyFile =
         crate::fs_utils::read_json(&state.data_path("credits_daily.json"));
     let rc: crate::models::RemainingCreditsFile =
         crate::fs_utils::read_json(&state.data_path("remaining_credits.json"));
+
+    let today = crate::fs_utils::today_prefix();
+    let consumed_by_uid_today = {
+        let today_map = file
+            .snapshots
+            .iter()
+            .find(|s| s.date == today)
+            .and_then(|s| s.per_account.as_ref());
+        let prev_map = file
+            .snapshots
+            .iter()
+            .filter(|s| s.date < today)
+            .last()
+            .and_then(|s| s.per_account.as_ref());
+        match (today_map, prev_map) {
+            // 当日无快照或昨日无 per_account 时返回空对象(旧算法无法拆到单号)
+            (Some(today_map), Some(prev_map)) => {
+                let hist: crate::models::CreditsFile =
+                    crate::fs_utils::read_json(&state.data_path("credits_history.json"));
+                let mut earned_by_uid: std::collections::HashMap<String, f64> =
+                    std::collections::HashMap::new();
+                for r in &hist.records {
+                    if r.date != today || r.user_id == "_daily_total" {
+                        continue;
+                    }
+                    *earned_by_uid.entry(r.user_id.clone()).or_insert(0.0) += r.delta as f64;
+                }
+                crate::credits::consumed_by_uid(prev_map, today_map, &earned_by_uid)
+            }
+            _ => std::collections::BTreeMap::new(),
+        }
+    };
+
     serde_json::json!({
         "snapshots": file.snapshots,
         "dataUpdatedAt": rc.updated_at,
+        "consumedByUidToday": consumed_by_uid_today,
+        "consumedDate": today,
     })
 }
 

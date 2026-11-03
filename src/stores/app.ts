@@ -153,6 +153,9 @@ export const useAppStore = defineStore('app', () => {
   const creditsDaily = ref<CreditsDailySnapshot[]>([])
   // remaining_credits.json 的 updated_at(数据截至时间)
   const creditsUpdatedAt = ref<string | null>(null)
+  // 今日逐账号消耗(uid -> 消耗),与看板「今日消耗」同口径
+  const consumedByUidToday = ref<Record<string, number>>({})
+  const consumedByUidDate = ref<string | null>(null)
 
   // 计算属性
   const enabledAccounts = computed(() => accounts.value.filter(a => a.enabled))
@@ -439,14 +442,23 @@ export const useAppStore = defineStore('app', () => {
   async function refreshAllCredits() {
     const result = await invoke<number>('refresh_all_remaining_credits')
     await fetchAccounts()
+    // 合流:设置页只调本方法,必须一并重拉快照,否则看板数字要到手动再刷一次才变
+    await fetchCreditsDaily()
     return result
   }
 
   // 每日积分快照
   async function fetchCreditsDaily() {
-    const result = await invoke<{ snapshots: CreditsDailySnapshot[]; dataUpdatedAt: string | null }>('credits_daily_list')
+    const result = await invoke<{
+      snapshots: CreditsDailySnapshot[]
+      dataUpdatedAt: string | null
+      consumedByUidToday?: Record<string, number> | null
+      consumedDate?: string | null
+    }>('credits_daily_list')
     creditsDaily.value = result?.snapshots || []
     creditsUpdatedAt.value = result?.dataUpdatedAt ?? null
+    consumedByUidToday.value = result?.consumedByUidToday || {}
+    consumedByUidDate.value = result?.consumedDate ?? null
     return result
   }
 
@@ -501,6 +513,8 @@ export const useAppStore = defineStore('app', () => {
     checkinTotal,
     creditsDaily,
     creditsUpdatedAt,
+    consumedByUidToday,
+    consumedByUidDate,
     // 计算属性
     enabledAccounts,
     todayCheckedCount,

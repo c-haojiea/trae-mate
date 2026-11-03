@@ -73,6 +73,26 @@
           title="该额度已过期但 TRAE 仍将其留在额度列表并计入余额"
         >ⓘ</span>
       </p>
+      <!-- 按账号消耗(今日) -->
+      <div class="cb-consumed">
+        <div class="cb-consumed-head">
+          <span class="cb-consumed-title">按账号消耗（今日）</span>
+          <button
+            v-if="consumedRows.length > 5"
+            class="cb-range-btn"
+            @click="showAllConsumed = !showAllConsumed"
+          >
+            {{ showAllConsumed ? '收起' : '展开全部' }}
+          </button>
+        </div>
+        <ul v-if="consumedRows.length" class="cb-accounts">
+          <li v-for="r in visibleConsumedRows" :key="r.uid" class="cb-account-row">
+            <span class="cb-account-name">{{ r.name }}</span>
+            <span class="cb-account-value">{{ fmt(r.value) }}</span>
+          </li>
+        </ul>
+        <p v-else class="cb-hint">今日无可见消耗（或数据未刷新）</p>
+      </div>
       <p v-if="!todaySnap" class="cb-hint">今日尚未刷新积分</p>
       <p v-if="exportPaths.length" class="cb-export-paths">
         已导出：<br />{{ exportPaths[0] }}<br />{{ exportPaths[1] }}
@@ -194,6 +214,27 @@ const todayExpired = computed(() => {
   const s = todaySnap.value as unknown as { expired?: number | null } | undefined
   return s?.expired ?? 0
 })
+
+// 按账号消耗(今日):uid -> 消耗,降序,只保留 >0 的号
+const showAllConsumed = ref(false)
+const nameByUid = computed(() => {
+  const map: Record<string, string> = {}
+  for (const a of store.accounts) {
+    if (a.desktopUserId) map[a.desktopUserId] = a.name
+    if (a.userId) map[a.userId] = a.name
+  }
+  return map
+})
+const consumedRows = computed(() => {
+  const src = (store.consumedByUidToday || {}) as Record<string, number>
+  return Object.entries(src)
+    .map(([uid, v]) => ({ uid, value: Number(v) || 0, name: nameByUid.value[uid] || uid.slice(-6) }))
+    .filter((r) => r.value > 0)
+    .sort((a, b) => b.value - a.value)
+})
+const visibleConsumedRows = computed(() =>
+  showAllConsumed.value ? consumedRows.value : consumedRows.value.slice(0, 5)
+)
 
 // 按选中档位切片,按日期倒序(0=全部,不截断)
 const recent = computed(() => {
@@ -505,6 +546,23 @@ function fmt(n: number): string {
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
+}
+
+.cb-consumed {
+  margin: 10px 0 4px;
+}
+
+.cb-consumed-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.cb-consumed-title {
+  font-size: 12px;
+  color: var(--text-secondary);
 }
 
 .cb-empty {
