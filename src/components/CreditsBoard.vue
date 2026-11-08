@@ -183,6 +183,49 @@
         </template>
       </div>
 
+      <!-- 按账号历史累计(可归属) -->
+      <div class="cb-section cb-uid-history">
+        <h3 class="cb-section-title">按账号历史累计（可归属）</h3>
+        <template v-if="uidHistory && uidHistory.attributableDays > 0">
+          <p class="cb-uid-note">
+            可归属 {{ uidHistory.attributableDays }} 天（{{ uidHistory.fromDate }} 至 {{ uidHistory.toDate }}）；更早
+            {{ uidHistory.missingDays }} 天无逐号数据，未计入
+          </p>
+          <div class="cb-month-filter">
+            <button
+              class="cb-range-btn"
+              :class="{ active: uidMonth === '' }"
+              @click="uidMonth = ''"
+            >
+              全部
+            </button>
+            <button
+              v-for="mo in uidMonths"
+              :key="mo"
+              class="cb-range-btn"
+              :class="{ active: uidMonth === mo }"
+              @click="uidMonth = mo"
+            >
+              {{ mo }}
+            </button>
+          </div>
+          <ul class="cb-accounts">
+            <li v-for="r in visibleUidRows" :key="r.uid" class="cb-account-row">
+              <span class="cb-account-name">{{ r.name }}</span>
+              <span class="cb-account-value">{{ fmt(r.value) }}</span>
+            </li>
+          </ul>
+          <button
+            v-if="uidRows.length > 5"
+            class="btn btn-sm btn-outline cb-months-toggle"
+            @click="showAllUid = !showAllUid"
+          >
+            {{ showAllUid ? '收起' : '展开全部' }}
+          </button>
+        </template>
+        <p v-else class="cb-hint">暂无可归属的逐号数据</p>
+      </div>
+
       <!-- 每账号当前余额 -->
       <div class="cb-section">
         <h3 class="cb-section-title">账号余额</h3>
@@ -300,6 +343,26 @@ const months = computed(() => {
 const showAllMonths = ref(false)
 const visibleMonths = computed(() =>
   showAllMonths.value ? months.value : months.value.slice(0, 2)
+)
+
+// 按账号可归属历史累计(后端已按 consumed_by_uid 同口径聚合)
+const uidHistory = computed(() => store.consumedByUidHistory)
+const uidMonth = ref('')
+const uidMonths = computed(() =>
+  Object.keys(uidHistory.value?.monthly || {}).sort((a, b) => b.localeCompare(a))
+)
+const uidRows = computed(() => {
+  const h = uidHistory.value
+  if (!h) return []
+  const src = uidMonth.value ? h.monthly?.[uidMonth.value] || {} : h.total || {}
+  return Object.entries(src)
+    .map(([uid, v]) => ({ uid, value: Number(v) || 0, name: nameByUid.value[uid] || uid.slice(-6) }))
+    .filter((r) => r.value > 0)
+    .sort((a, b) => b.value - a.value)
+})
+const showAllUid = ref(false)
+const visibleUidRows = computed(() =>
+  showAllUid.value ? uidRows.value : uidRows.value.slice(0, 5)
 )
 
 // 按选中档位切片,按日期倒序(0=全部,不截断)
@@ -655,6 +718,20 @@ function fmt(n: number): string {
 
 .cb-months-toggle {
   margin-top: 6px;
+}
+
+.cb-uid-note {
+  margin: 2px 0 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.cb-month-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
 }
 
 .cb-empty {

@@ -258,6 +258,71 @@ pub fn consumed_by_uid(
     out
 }
 
+/// 按账号可归属消耗累计:逐日复用 consumed_by_uid,只统计前后两天都有 per_account 的可归属日。
+pub fn accumulate_consumed_by_uid(
+    snapshots: &[CreditsDailySnapshot],
+    history: &CreditsFile,
+) -> crate::models::ConsumedByUidHistory {
+    use std::collections::HashMap;
+    let mut out = crate::models::ConsumedByUidHistory::default();
+
+    let mut sorted: Vec<&CreditsDailySnapshot> = snapshots.iter().collect();
+    sorted.sort_by(|a, b| a.date.cmp(&b.date));
+
+    // 按日期聚合签到 delta(排除汇总占位行)
+    let mut earned_by_date: HashMap<&str, HashMap<String, f64>> = HashMap::new();
+    for r in &history.records {
+        if r.user_id == "_daily_total" {
+            continue;
+        }
+        *earned_by_date
+            .entry(r.date.as_str())
+            .or_default()
+            .entry(r.user_id.clone())
+            .or_insert(0.0) += r.delta as f64;
+    }
+
+    for i in 1..sorted.len() {
+        let prev = sorted[i - 1];
+        let cur = sorted[i];
+        let (Some(prev_map), Some(today_map)) = (prev.per_account.as_ref(), cur.per_account.as_ref())
+        else {
+            continue;
+        };
+        let empty: HashMap<String, f64> = HashMap::new();
+        let earned = earned_by_date.get(cur.date.as_str()).unwrap_or(&empty);
+        let by_uid = consumed_by_uid(prev_map, today_map, earned);
+
+        let month = cur.date.get(0..7).unwrap_or("").to_string();
+        for (uid, v) in by_uid {
+            *out.total.entry(uid.clone()).or_insert(0.0) += v;
+            *out.monthly
+                .entry(month.clone())
+                .or_default()
+                .entry(uid)
+                .or_insert(0.0) += v;
+        }
+        out.attributable_days += 1;
+        if out.from_date.is_none() {
+            out.from_date = Some(cur.date.clone());
+        }
+        out.to_date = Some(cur.date.clone());
+    }
+
+    out.missing_days = snapshots.len().saturating_sub(out.attributable_days);
+    // 累加后统一两位小数,避免浮点尾巴
+    for v in out.total.values_mut() {
+        *v = round2(*v);
+    }
+    for map in out.monthly.values_mut() {
+        for v in map.values_mut() {
+            *v = round2(*v);
+        }
+    }
+
+    out
+}
+
 /// 余额观测入账:昨日已存在账号的 max(0, 今日余额 − 昨日余额) 之和。
 /// 今日新入库的 uid 不在昨日快照里,自然被排除(新号入库不计入账口径)。
 fn earned_observed(
@@ -840,5 +905,38 @@ mod tests {
         let by_uid = consumed_by_uid(&prev, &today, &earned);
         assert_eq!(by_uid.get("a"), Some(&0.0), "余额净增时消耗必须为 0");
         assert_eq!(by_uid.values().sum::<f64>(), 0.0);
+    }
+
+    /// 可归属累计:只有前后两天都有 per_account 的日才计入
+    #[test]
+    fn accumulate_consumed_by_uid_skips_days_without_per_account() {
+        let d1 = CreditsDailySnapshot {
+            date: "2026-11-01".into(),
+            per_account: None,
+            ..Default::default()
+        };
+        let d2 = CreditsDailySnapshot {
+            date: "2026-11-02".into(),
+            per_account: Some(balances(&[("a", 100.0)])),
+            ..Default::default()
+        };
+        let d3 = CreditsDailySnapshot {
+            date: "2026-11-03".into(),
+            per_account: Some(balances(&[("a", 50.0)])),
+            ..Default::default()
+        };
+
+        let out = accumulate_consumed_by_uid(&[d1, d2, d3], &CreditsFile::default());
+
+        assert_eq!(out.attributable_days, 1, "只有 day2→day3 可归属");
+        assert_eq!(out.missing_days, 2, "day1 与 day1→day2 均无逐号数据");
+        assert_eq!(out.from_date.as_deref(), Some("2026-11-03"));
+        assert_eq!(out.to_date.as_deref(), Some("2026-11-03"));
+        assert_eq!(out.total.get("a"), Some(&50.0), "100 → 50 计 50");
+        assert_eq!(
+            out.monthly.get("2026-11").and_then(|m| m.get("a")),
+            Some(&50.0),
+            "月份键应为 2026-11"
+        );
     }
 }

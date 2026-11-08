@@ -5,8 +5,8 @@
       <div class="stat-card">
         <div class="stat-icon total"><Icon name="users" :size="22" /></div>
         <div class="stat-info">
-          <span class="stat-value">{{ store.accounts.length }}</span>
-          <span class="stat-label">总账号数</span>
+          <span class="stat-value">{{ usableAccounts.length }} / {{ store.accounts.length }}</span>
+          <span class="stat-label">可用 / 总数</span>
         </div>
       </div>
       <div class="stat-card">

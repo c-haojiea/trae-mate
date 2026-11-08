@@ -523,6 +523,8 @@ pub fn credits_daily_list(state: State<'_, AppState>) -> serde_json::Value {
         crate::fs_utils::read_json(&state.data_path("credits_daily.json"));
     let rc: crate::models::RemainingCreditsFile =
         crate::fs_utils::read_json(&state.data_path("remaining_credits.json"));
+    let hist: crate::models::CreditsFile =
+        crate::fs_utils::read_json(&state.data_path("credits_history.json"));
 
     let today = crate::fs_utils::today_prefix();
     let consumed_by_uid_today = {
@@ -540,8 +542,6 @@ pub fn credits_daily_list(state: State<'_, AppState>) -> serde_json::Value {
         match (today_map, prev_map) {
             // 当日无快照或昨日无 per_account 时返回空对象(旧算法无法拆到单号)
             (Some(today_map), Some(prev_map)) => {
-                let hist: crate::models::CreditsFile =
-                    crate::fs_utils::read_json(&state.data_path("credits_history.json"));
                 let mut earned_by_uid: std::collections::HashMap<String, f64> =
                     std::collections::HashMap::new();
                 for r in &hist.records {
@@ -555,12 +555,16 @@ pub fn credits_daily_list(state: State<'_, AppState>) -> serde_json::Value {
             _ => std::collections::BTreeMap::new(),
         }
     };
+    // 按账号可归属历史累计(只统计前后两天都有 per_account 的可归属日)
+    let consumed_by_uid_history =
+        crate::credits::accumulate_consumed_by_uid(&file.snapshots, &hist);
 
     serde_json::json!({
         "snapshots": file.snapshots,
         "dataUpdatedAt": rc.updated_at,
         "consumedByUidToday": consumed_by_uid_today,
         "consumedDate": today,
+        "consumedByUidHistory": consumed_by_uid_history,
     })
 }
 
@@ -578,11 +582,13 @@ pub fn credits_export_csv(state: State<'_, AppState>) -> AppResult<Vec<String>> 
     snaps.sort_by(|a, b| a.date.cmp(&b.date));
 
     let mut csv_daily = String::from(
-        "date,total,earned,earned_observed,earned_gap,expired,consumed,legacy\r\n",
+        "date,total,earned,earned_observed,earned_gap,expired,consumed,cumulative_total,is_legacy,legacy\r\n",
     );
+    let mut cumulative = 0.0f64;
     for s in &snaps {
         // 旧数据(无 per_account)一律视为旧算法算出
         let legacy = s.consumed_legacy || s.per_account.is_none();
+        cumulative += s.consumed;
         // 旧行没有观测入账/缺口/过期额度字段:按空值输出,不做回填推算
         let observed = s
             .earned_observed
@@ -593,8 +599,9 @@ pub fn credits_export_csv(state: State<'_, AppState>) -> AppResult<Vec<String>> 
             _ => String::new(),
         };
         let expired = s.expired.map(|v| format!("{v:.2}")).unwrap_or_default();
+        let flag = if legacy { "true" } else { "false" };
         csv_daily.push_str(&format!(
-            "{},{},{},{},{},{},{},{}\r\n",
+            "{},{},{},{},{},{},{},{},{},{}\r\n",
             s.date,
             format!("{:.2}", s.total),
             format!("{:.2}", s.earned),
@@ -602,7 +609,9 @@ pub fn credits_export_csv(state: State<'_, AppState>) -> AppResult<Vec<String>> 
             gap,
             expired,
             format!("{:.2}", s.consumed),
-            if legacy { "true" } else { "false" }
+            format!("{cumulative:.2}"),
+            flag,
+            flag
         ));
     }
     let daily_path = export_dir.join(format!("credits_daily_{stamp}.csv"));

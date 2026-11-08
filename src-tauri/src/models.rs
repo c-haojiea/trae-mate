@@ -500,6 +500,19 @@ pub struct RemainingCreditsFile {
     pub updated_at: Option<String>,
 }
 
+/// 按账号可归属消耗累计(仅统计逐日 per_account 齐全的可归属日)
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsumedByUidHistory {
+    pub from_date: Option<String>,
+    pub to_date: Option<String>,
+    pub attributable_days: usize,
+    pub missing_days: usize,
+    pub total: std::collections::BTreeMap<String, f64>,
+    pub monthly:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

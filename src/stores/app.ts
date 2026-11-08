@@ -84,6 +84,18 @@ export interface CreditsDailySnapshot {
   per_account?: Record<string, number> | null
   /** 该条 consumed 是否由旧算法(净值绝对值)得出 */
   consumed_legacy?: boolean
+  /** 已过期未用额度(旧快照无此字段) */
+  expired?: number | null
+}
+
+/** 按账号可归属历史累计(仅统计逐日 per_account 齐全的可归属日) */
+export interface ConsumedByUidHistory {
+  fromDate?: string | null
+  toDate?: string | null
+  attributableDays: number
+  missingDays: number
+  total: Record<string, number>
+  monthly: Record<string, Record<string, number>>
 }
 
 export interface JwtPreview {
@@ -160,6 +172,8 @@ export const useAppStore = defineStore('app', () => {
   // 今日逐账号消耗(uid -> 消耗),与看板「今日消耗」同口径
   const consumedByUidToday = ref<Record<string, number>>({})
   const consumedByUidDate = ref<string | null>(null)
+  // 按账号可归属历史累计
+  const consumedByUidHistory = ref<ConsumedByUidHistory | null>(null)
 
   // 计算属性
   const enabledAccounts = computed(() => accounts.value.filter(a => a.enabled))
@@ -458,11 +472,13 @@ export const useAppStore = defineStore('app', () => {
       dataUpdatedAt: string | null
       consumedByUidToday?: Record<string, number> | null
       consumedDate?: string | null
+      consumedByUidHistory?: ConsumedByUidHistory | null
     }>('credits_daily_list')
     creditsDaily.value = result?.snapshots || []
     creditsUpdatedAt.value = result?.dataUpdatedAt ?? null
     consumedByUidToday.value = result?.consumedByUidToday || {}
     consumedByUidDate.value = result?.consumedDate ?? null
+    consumedByUidHistory.value = result?.consumedByUidHistory || null
     return result
   }
 
@@ -519,6 +535,7 @@ export const useAppStore = defineStore('app', () => {
     creditsUpdatedAt,
     consumedByUidToday,
     consumedByUidDate,
+    consumedByUidHistory,
     // 计算属性
     enabledAccounts,
     todayCheckedCount,
