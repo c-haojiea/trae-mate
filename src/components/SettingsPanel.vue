@@ -2,7 +2,11 @@
   <div class="settings-panel">
     <div class="settings-section card usage-guide">
       <h3 class="section-title">使用提示</h3>
-      <p class="section-desc">请先在 TRAE 桌面客户端登录账号，再导入当前桌面账号。导入后可在账号卡片中修改显示名称；签到和总积分查询会自动使用该账号凭证，签到完成后会自动刷新积分，无需反复切换账号。</p>
+      <p class="section-desc">
+        1. 导入账号：在 TRAE 桌面客户端登录后，用「导入当前桌面账号」或扫描已有实例目录导入<br>
+        2. 多开实例：每个账号使用独立 data-dir 启动，凭证已绑定，无需在客户端重复登录<br>
+        3. 凭证续期：令牌到期时需先打开该账号的实例完成续期，再点账号卡片上的「刷新凭证」
+      </p>
     </div>
     <div class="settings-section card" v-if="store.settings">
       <h3 class="section-title">自动签到</h3>
@@ -37,7 +41,7 @@
       <div class="setting-item">
         <div class="setting-info">
           <span class="setting-label">账号间隔</span>
-          <span class="setting-desc">自动签到每个账号之间的冷却间隔（最短 3 分钟）</span>
+          <span class="setting-desc">批量签到时每个账号之间的等待间隔（最短 3 分钟）；10 个账号约需 30 分钟</span>
         </div>
         <select
           class="input select-input"
@@ -56,7 +60,7 @@
       <div class="setting-item">
         <div class="setting-info">
           <span class="setting-label">失败重试次数</span>
-          <span class="setting-desc">仅网络异常自动重试（业务失败不重试）</span>
+          <span class="setting-desc">单个请求网络异常时的重试次数（间隔 1 秒）；签到业务失败不重试，当天由调度最多再试 3 次</span>
         </div>
         <select
           class="input select-input"
@@ -87,7 +91,7 @@
       <div class="setting-item">
         <div class="setting-info">
           <span class="setting-label">开机自启动</span>
-          <span class="setting-desc">开机时自动启动,隐藏到托盘不弹出窗口</span>
+          <span class="setting-desc">开机时自动启动,隐藏到托盘不弹出窗口；关闭主窗口会退出应用，需要夜间自动快照请最小化而不是关闭</span>
         </div>
         <div
           class="switch"
@@ -127,99 +131,14 @@
     </div>
 
     <div class="settings-section card" v-if="store.settings">
-      <h3 class="section-title">TRAE 桌面接口签到</h3>
-      <p class="section-desc">每个账号首次导入一次；后续一键签到和定时签到会自动使用该账号的本地加密凭证。</p>
-
-      <div class="mode-options">
-        <div
-          class="mode-option"
-          :class="{ active: store.settings.checkinMode === 'webview' }"
-          style="display: none"
-        >
-          <div class="mode-icon"><Icon name="globe" :size="28" /></div>
-          <div class="mode-info">
-            <span class="mode-name">Webview 模式</span>
-            <span class="mode-desc">内置浏览器自动点击签到按钮，无需配置，推荐使用</span>
-          </div>
-          <div class="mode-radio" :class="{ checked: store.settings.checkinMode === 'webview' }"></div>
-        </div>
-
-        <div
-          class="mode-option"
-          :class="{ active: store.settings.checkinMode === 'api' }"
-          style="display: none"
-        >
-          <div class="mode-icon"><Icon name="bolt" :size="28" /></div>
-          <div class="mode-info">
-            <span class="mode-name">API 模式</span>
-            <span class="mode-desc">直接调用签到 API，速度更快，需自行抓包配置</span>
-          </div>
-          <div class="mode-radio" :class="{ checked: store.settings.checkinMode === 'api' }"></div>
-        </div>
-      </div>
+      <h3 class="section-title">桌面凭证签到</h3>
+      <p class="section-desc">凭证失效时先打开该实例完成续期，再点刷新凭证；无需重复导入。</p>
 
       <div class="tip-box">
         <div class="tip-icon"><Icon name="lock" :size="20" /></div>
         <div class="tip-content">
           <p class="tip-title">多账号与凭证失效</p>
-          <p class="tip-desc">导入时先在 TRAE 客户端切换目标账号。凭证失效时仅需重新导入该账号，其他账号不受影响。</p>
-        </div>
-      </div>
-
-      <!-- 旧 API 配置仅用于兼容已有设置，不再在界面显示。 -->
-      <div class="api-config" v-if="false">
-        <div class="form-group">
-          <label class="form-label">签到接口地址</label>
-          <input
-            type="text"
-            class="input"
-            :value="store.settings?.apiConfig?.checkinUrl || ''"
-            @input="updateApiConfig('checkinUrl', ($event.target as HTMLInputElement).value)"
-            placeholder="https://api.example.com/checkin"
-          />
-        </div>
-
-        <div class="form-group">
-          <label class="form-label">请求方法</label>
-          <select
-            class="input select-input"
-            :value="store.settings?.apiConfig?.method || 'POST'"
-            @change="updateApiConfig('method', ($event.target as HTMLSelectElement).value)"
-          >
-            <option value="GET">GET</option>
-            <option value="POST">POST</option>
-          </select>
-        </div>
-
-        <div class="form-group">
-          <label class="form-label">请求头 (JSON 格式)</label>
-          <textarea
-            class="input textarea"
-            rows="4"
-            :value="formatJson(store.settings?.apiConfig?.headers)"
-            @change="updateApiHeaders"
-            placeholder='{"Authorization": "Bearer xxx"}'
-          ></textarea>
-          <p class="form-hint">Cookie 会自动从账号配置中注入，无需填写</p>
-        </div>
-
-        <div class="form-group">
-          <label class="form-label">请求体 (JSON 格式，POST 时使用)</label>
-          <textarea
-            class="input textarea"
-            rows="3"
-            :value="formatJson(store.settings?.apiConfig?.body)"
-            @change="updateApiBody"
-            placeholder='{"type": "daily"}'
-          ></textarea>
-        </div>
-
-        <div class="tip-box warning">
-          <div class="tip-icon"><Icon name="exclamation-triangle" :size="20" /></div>
-          <div class="tip-content">
-            <p class="tip-title">需要自行抓包获取</p>
-            <p class="tip-desc">API 模式需要你通过浏览器开发者工具自行抓取签到接口的地址、请求头和参数</p>
-          </div>
+          <p class="tip-desc">凭证失效时先打开该实例完成续期，再点「刷新凭证」；其他账号不受影响。</p>
         </div>
       </div>
     </div>
@@ -240,6 +159,12 @@
           <span class="status-value">{{ nextRunText }}</span>
         </div>
         <div class="status-item">
+          <span class="status-label">下次自动快照</span>
+          <span class="status-value">
+            {{ store.settings?.creditsSnapshotEnabled ? store.settings?.creditsSnapshotTime : '未启用' }}
+          </span>
+        </div>
+        <div class="status-item">
           <span class="status-label">启用账号数</span>
           <span class="status-value">{{ store.enabledAccounts.length }} 个</span>
         </div>
@@ -248,7 +173,7 @@
 
     <div class="settings-section card">
       <h3 class="section-title">签到核心 · 参考模式</h3>
-      <p class="section-desc">签到走稳定伪设备 ID + 完整请求头 + 错误冷却状态机(仿 TraeWorkAssistant 处理模式)</p>
+      <p class="section-desc">稳定伪设备 ID + 完整请求头 + 错误冷却状态机</p>
 
       <div class="setting-item">
         <div class="setting-info">
@@ -264,7 +189,7 @@
       <div class="setting-item">
         <div class="setting-info">
           <span class="setting-label">每日自动快照</span>
-          <span class="setting-desc">到点自动刷新余额并重写当日快照，解决跨零点消耗归因（需应用保持运行）</span>
+          <span class="setting-desc">到点自动刷新余额并重写当日快照，解决跨零点消耗归因；应用需保持运行，关机或退出则不触发</span>
         </div>
         <div
           class="switch"
@@ -290,7 +215,7 @@
       <div class="setting-item">
         <div class="setting-info">
           <span class="setting-label">清空所有冷却</span>
-          <span class="setting-desc">重置全部账号的签到错误冷却状态(SessionDead 永久冷却除外需重新登录)</span>
+          <span class="setting-desc">仅清除可恢复的冷却；SessionDead（令牌已无法续期）不会被清除，需打开实例或重新授权</span>
         </div>
         <button class="btn btn-sm btn-outline danger" @click="handleClearAllCooldowns">
           清空冷却
@@ -300,7 +225,7 @@
 
     <div class="settings-section card">
       <h3 class="section-title">实例启动 · TRAE 客户端路径</h3>
-      <p class="section-desc">启动独立实例需要指定 TRAE Work CN 客户端(TRAE SOLO CN.exe),为每个账号启动独立实例</p>
+      <p class="section-desc">自动识别 Trae CN / TRAE SOLO CN 等候选客户端；扫描失败时可手动选择</p>
 
       <div class="setting-item">
         <div class="setting-info">
@@ -331,7 +256,7 @@
 
     <div class="settings-section card">
       <h3 class="section-title">关于</h3>
-      <p class="section-desc">TraeMate · TRAE Work 签到与多开账号管理</p>
+      <p class="section-desc">TraeMate · TRAE 多账号签到与实例管理</p>
       <p class="section-desc">支持多账号凭证管理、自动签到、签到后总积分刷新和账号显示名称编辑。凭证仅保存在本机，用于调用 TRAE 桌面接口。</p>
 
       <div class="about-info">
@@ -513,76 +438,6 @@ async function toggleNotifyFailed() {
 async function toggleLaunchAtLogin() {
   if (!store.settings) return
   await store.saveSettings({ launchAtLogin: !store.settings.launchAtLogin })
-}
-
-async function setCheckinMode(mode: 'webview' | 'api') {
-  await store.saveSettings({ checkinMode: mode })
-}
-
-async function updateApiConfig(key: string, value: string) {
-  if (!store.settings) return
-  const current = store.settings.apiConfig || {
-    checkinUrl: '',
-    method: 'POST' as const,
-    headers: {}
-  }
-  await store.saveSettings({
-    apiConfig: {
-      ...current,
-      [key]: value
-    }
-  })
-}
-
-async function updateApiHeaders(e: Event) {
-  const value = (e.target as HTMLTextAreaElement).value
-  try {
-    const headers = value.trim() ? JSON.parse(value) : {}
-    if (!store.settings) return
-    const current = store.settings.apiConfig || {
-      checkinUrl: '',
-      method: 'POST' as const,
-      headers: {}
-    }
-    await store.saveSettings({
-      apiConfig: {
-        ...current,
-        headers
-      }
-    })
-  } catch {
-    // JSON 解析失败，暂时不保存
-  }
-}
-
-async function updateApiBody(e: Event) {
-  const value = (e.target as HTMLTextAreaElement).value
-  try {
-    const body = value.trim() ? JSON.parse(value) : undefined
-    if (!store.settings) return
-    const current = store.settings.apiConfig || {
-      checkinUrl: '',
-      method: 'POST' as const,
-      headers: {}
-    }
-    await store.saveSettings({
-      apiConfig: {
-        ...current,
-        body
-      }
-    })
-  } catch {
-    // JSON 解析失败，暂时不保存
-  }
-}
-
-function formatJson(obj?: Record<string, any>): string {
-  if (!obj || Object.keys(obj).length === 0) return ''
-  try {
-    return JSON.stringify(obj, null, 2)
-  } catch {
-    return ''
-  }
 }
 </script>
 

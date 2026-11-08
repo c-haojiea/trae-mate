@@ -1,13 +1,13 @@
 <template>
-  <section class="credits-board card">
+  <section class="credits-board card" :class="{ 'credits-page': asPage }">
     <div
       class="cb-header"
       role="button"
       tabindex="0"
-      @click="expanded = !expanded"
-      @keydown.enter="expanded = !expanded"
+      @click="!asPage && (expanded = !expanded)"
+      @keydown.enter="!asPage && (expanded = !expanded)"
     >
-      <span class="cb-caret">{{ expanded ? '▾' : '▸' }}</span>
+      <span class="cb-caret" v-if="!asPage">{{ expanded ? '▾' : '▸' }}</span>
       <h2 class="cb-title">积分看板</h2>
       <span class="cb-summary">
         {{ todaySnap ? `今日消耗 ${fmt(todaySnap.consumed)} · 新增 ${fmt(todaySnap.earned)}` : '今日尚未刷新积分' }}
@@ -30,7 +30,7 @@
       </button>
     </div>
 
-    <div v-if="expanded" class="cb-body">
+    <div v-if="expanded || asPage" class="cb-body">
       <!-- 今日三项 -->
       <div class="cb-today-head">
         <span class="cb-today-title">今日</span>
@@ -151,6 +151,38 @@
         </p>
       </div>
 
+      <!-- 历史累计 -->
+      <div class="cb-section cb-history">
+        <h3 class="cb-section-title">历史累计</h3>
+        <template v-if="store.creditsDaily.length">
+          <p class="cb-history-total">
+            累计消耗 {{ fmt(historyTotal) }}（{{ historyRangeText }}）
+            <span v-if="historyHasLegacy" class="cb-legacy">早期数据含旧算法，仅供参考</span>
+          </p>
+          <p class="cb-hint">更早数据不可得</p>
+          <ul class="cb-accounts">
+            <li v-for="m in visibleMonths" :key="m.month" class="cb-account-row">
+              <span class="cb-account-name">{{ m.month }}</span>
+              <span class="cb-account-value">{{ fmt(m.consumed) }}</span>
+              <span class="cb-month-days">
+                {{ m.days }} 天<template v-if="m.hasLegacy"> · 含旧算法日</template>
+              </span>
+            </li>
+          </ul>
+          <button
+            v-if="months.length > 2"
+            class="btn btn-sm btn-outline cb-months-toggle"
+            @click="showAllMonths = !showAllMonths"
+          >
+            {{ showAllMonths ? '收起' : '展开全部' }}
+          </button>
+        </template>
+        <template v-else>
+          <p class="cb-history-total">累计消耗 0.00</p>
+          <p class="cb-hint">暂无历史数据</p>
+        </template>
+      </div>
+
       <!-- 每账号当前余额 -->
       <div class="cb-section">
         <h3 class="cb-section-title">账号余额</h3>
@@ -170,9 +202,13 @@
 import { computed, ref } from 'vue'
 import { useAppStore } from '../stores/app'
 
+const props = defineProps<{
+  /// 作为独立页面时:强制展开、不可折叠
+  asPage?: boolean
+}>()
 const store = useAppStore()
 const emit = defineEmits<{ (e: 'notify', message: string, type?: 'success' | 'error'): void }>()
-const expanded = ref(false)
+const expanded = ref(props.asPage === true)
 const refreshing = ref(false)
 const exporting = ref(false)
 const exportPaths = ref<string[]>([])
@@ -234,6 +270,36 @@ const consumedRows = computed(() => {
 })
 const visibleConsumedRows = computed(() =>
   showAllConsumed.value ? consumedRows.value : consumedRows.value.slice(0, 5)
+)
+
+// 历史累计:全部来自 store.creditsDaily(缺 consumed 的行跳过)
+const historyTotal = computed(() =>
+  store.creditsDaily.reduce((sum, s) => sum + (typeof s.consumed === 'number' ? s.consumed : 0), 0)
+)
+const historyHasLegacy = computed(() => store.creditsDaily.some((s) => s.consumed_legacy === true))
+const historyRangeText = computed(() => {
+  const dates = store.creditsDaily.map((s) => s.date).sort()
+  if (!dates.length) return '—'
+  return `${dates[0]} 至 ${dates[dates.length - 1]}`
+})
+const months = computed(() => {
+  const map = new Map<string, { consumed: number; days: number; hasLegacy: boolean }>()
+  for (const s of store.creditsDaily) {
+    if (typeof s.consumed !== 'number') continue
+    const key = s.date.slice(0, 7)
+    const cur = map.get(key) || { consumed: 0, days: 0, hasLegacy: false }
+    cur.consumed += s.consumed
+    cur.days += 1
+    if (s.consumed_legacy === true) cur.hasLegacy = true
+    map.set(key, cur)
+  }
+  return [...map.entries()]
+    .map(([month, v]) => ({ month, ...v }))
+    .sort((a, b) => b.month.localeCompare(a.month))
+})
+const showAllMonths = ref(false)
+const visibleMonths = computed(() =>
+  showAllMonths.value ? months.value : months.value.slice(0, 2)
 )
 
 // 按选中档位切片,按日期倒序(0=全部,不截断)
@@ -563,6 +629,32 @@ function fmt(n: number): string {
 .cb-consumed-title {
   font-size: 12px;
   color: var(--text-secondary);
+}
+
+/* 作为独立页面时:铺满内容区,不折叠 */
+.credits-page {
+  margin: 0;
+}
+
+.credits-page .cb-body {
+  padding-top: 4px;
+}
+
+.cb-history-total {
+  margin: 2px 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.cb-month-days {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.cb-months-toggle {
+  margin-top: 6px;
 }
 
 .cb-empty {

@@ -43,7 +43,19 @@
         >
           <span class="nav-icon"><Icon name="users" :size="18" /></span>
           <span>账号管理</span>
-          <span class="nav-badge" v-if="store.accounts.length">{{ store.accounts.length }}</span>
+          <span class="nav-badge" v-if="usableCount">{{ usableCount }}</span>
+        </div>
+        <div
+          class="nav-item"
+          role="button"
+          tabindex="0"
+          :class="{ active: activeTab === 'credits' }"
+          @click="activeTab = 'credits'"
+          @keydown.enter="activeTab = 'credits'"
+        >
+          <span class="nav-icon"><Icon name="banknotes" :size="18" /></span>
+          <span>积分看板</span>
+          <small class="nav-sub">今日消耗 {{ todayConsumedText }}</small>
         </div>
         <div
           class="nav-item"
@@ -55,6 +67,18 @@
         >
           <span class="nav-icon"><Icon name="clipboard-list" :size="18" /></span>
           <span>签到日志</span>
+        </div>
+        <div
+          class="nav-item"
+          role="button"
+          tabindex="0"
+          :class="{ active: activeTab === 'unlogged' }"
+          @click="activeTab = 'unlogged'"
+          @keydown.enter="activeTab = 'unlogged'"
+        >
+          <span class="nav-icon"><Icon name="exclamation-triangle" :size="18" /></span>
+          <span>实例未登录</span>
+          <span class="nav-badge warn" v-if="unloggedCount">{{ unloggedCount }}</span>
         </div>
         <div
           class="nav-item"
@@ -98,7 +122,9 @@
         <div class="top-bar-left">
           <h1 class="page-title">{{ currentPageTitle }}</h1>
           <p class="page-subtitle" v-if="activeTab === 'accounts'">管理你的 Trae Work 账号，一键签到</p>
+          <p class="page-subtitle" v-else-if="activeTab === 'credits'">今日消耗、按账号消耗与历史累计</p>
           <p class="page-subtitle" v-else-if="activeTab === 'logs'">查看所有签到记录和结果</p>
+          <p class="page-subtitle" v-else-if="activeTab === 'unlogged'">实例登录态失效的账号集中处理</p>
           <p class="page-subtitle" v-else>配置自动签到和通知设置</p>
         </div>
         <div class="top-bar-right">
@@ -139,13 +165,18 @@
         正在等待新实例登录,登录后将自动导入账号…
       </div>
 
-      <!-- 积分看板(默认折叠,点标题展开) -->
-      <CreditsBoard @notify="showToast" />
+      <!-- 实例未登录提示条(仅在账号管理页) -->
+      <div v-if="activeTab === 'accounts' && unloggedCount > 0" class="unlogged-banner">
+        <span>有 {{ unloggedCount }} 个实例未登录账号，已移入「实例未登录」</span>
+        <button class="btn btn-sm btn-outline" @click="activeTab = 'unlogged'">前往处理</button>
+      </div>
 
       <!-- 内容区域 -->
       <div class="content-area">
         <AccountList v-if="activeTab === 'accounts'" @add-account="showAddModal = true" @notify="showToast" />
+        <CreditsBoard v-else-if="activeTab === 'credits'" :as-page="true" @notify="showToast" />
         <CheckinLog v-else-if="activeTab === 'logs'" />
+        <UnloggedAccounts v-else-if="activeTab === 'unlogged'" @notify="showToast" />
         <SettingsPanel v-else @notify="showToast" />
       </div>
     </main>
@@ -170,12 +201,13 @@ import CheckinLog from './components/CheckinLog.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import AddAccountModal from './components/AddAccountModal.vue'
 import CreditsBoard from './components/CreditsBoard.vue'
+import UnloggedAccounts from './components/UnloggedAccounts.vue'
 import Icon from './components/Icon.vue'
 
 const appWindow = getCurrentWindow()
 
 const store = useAppStore()
-const activeTab = ref<'accounts' | 'logs' | 'settings'>('accounts')
+const activeTab = ref<'accounts' | 'credits' | 'logs' | 'unlogged' | 'settings'>('accounts')
 const showAddModal = ref(false)
 const toastMessage = ref('')
 const toastType = ref<'success' | 'error'>('success')
@@ -232,10 +264,24 @@ function toggleTheme() {
 const currentPageTitle = computed(() => {
   switch (activeTab.value) {
     case 'accounts': return '账号管理'
+    case 'credits': return '积分看板'
     case 'logs': return '签到日志'
+    case 'unlogged': return '实例未登录'
     case 'settings': return '设置'
     default: return ''
   }
+})
+
+// 可用账号(排除实例未登录的);侧栏徽标与账号管理页都用它
+const usableCount = computed(() => store.accounts.filter((a) => a.instanceLoggedIn !== false).length)
+const unloggedCount = computed(() => store.accounts.filter((a) => a.instanceLoggedIn === false).length)
+
+// 积分看板入口右侧的「今日消耗」
+const todayConsumedText = computed(() => {
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' })
+  const snap = store.creditsDaily.find((s) => s.date === today)
+  if (!snap || snap.consumed == null) return '—'
+  return Number(snap.consumed).toFixed(2)
 })
 
 async function handleCheckinAll() {
@@ -546,6 +592,35 @@ onMounted(() => {
   border-radius: var(--r-pill);
   font-weight: 700;
   box-shadow: 0 3px 10px rgba(0, 180, 216, 0.35);
+}
+
+.nav-badge.warn {
+  background: linear-gradient(135deg, #ff9a4d, #ff5c5c);
+  box-shadow: 0 3px 10px rgba(255, 92, 92, 0.35);
+}
+
+/* 页签右侧的次要摘要(如「今日消耗 123.45」) */
+.nav-sub {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.unlogged-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 12px;
+  padding: 10px 16px;
+  background: rgba(255, 154, 77, 0.12);
+  border: 1px solid rgba(255, 154, 77, 0.28);
+  border-radius: var(--r-sm);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .sidebar-footer {

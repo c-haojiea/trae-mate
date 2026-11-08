@@ -84,6 +84,7 @@
     <!-- 卡片底部 -->
     <div class="card-footer">
       <button
+        v-if="!hideCheckin"
         class="btn btn-sm btn-primary"
         @click="handleCheckin"
         :disabled="checkingIn || store.checkingIn || !account.enabled"
@@ -134,6 +135,8 @@ import { useAppStore, type Account, type InstanceState } from '../stores/app'
 
 const props = defineProps<{
   account: Account
+  /// 实例未登录页使用:隐藏「立即签到」按钮(其余按钮保留)
+  hideCheckin?: boolean
 }>()
 
 const emit = defineEmits(['toggle', 'delete', 'edit', 'notify'])

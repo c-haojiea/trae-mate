@@ -32,10 +32,10 @@
       </div>
     </div>
 
-    <!-- 账号列表 -->
-    <div class="accounts-grid" v-if="store.accounts.length > 0">
+    <!-- 账号列表(只显示可用账号,实例未登录的移入「实例未登录」页) -->
+    <div class="accounts-grid" v-if="usableAccounts.length > 0">
       <AccountCard
-        v-for="account in store.accounts"
+        v-for="account in usableAccounts"
         :key="account.id"
         :account="account"
         @toggle="handleToggle"
@@ -48,9 +48,15 @@
     <!-- 空状态 -->
     <div class="empty-state" v-else>
       <Icon name="inbox" :size="48" class="empty-state-icon" />
-      <p class="empty-state-text">还没有添加账号</p>
-      <p class="empty-state-desc">点击右上角「添加账号」按钮开始使用</p>
-      <button class="btn btn-primary" style="margin-top: 20px" @click="$emit('add-account')">
+      <p class="empty-state-text">暂无可管理账号</p>
+      <p class="empty-state-desc" v-if="store.accounts.length === 0">点击右上角「添加账号」按钮开始使用</p>
+      <p class="empty-state-desc" v-else>全部账号均为实例未登录状态，请到「实例未登录」页处理</p>
+      <button
+        v-if="store.accounts.length === 0"
+        class="btn btn-primary"
+        style="margin-top: 20px"
+        @click="$emit('add-account')"
+      >
         <Icon name="plus" :size="16" />
         <span>添加第一个账号</span>
       </button>
@@ -66,6 +72,11 @@ import Icon from './Icon.vue'
 
 const store = useAppStore()
 const emit = defineEmits(['add-account', 'notify'])
+
+// 只展示可用账号:instanceLoggedIn === false 的集中到「实例未登录」页
+const usableAccounts = computed(() =>
+  store.accounts.filter((a) => a.instanceLoggedIn !== false)
+)
 
 const totalPoints = computed(() => {
   return store.accounts.reduce((sum, a) => sum + (a.points || 0), 0)
