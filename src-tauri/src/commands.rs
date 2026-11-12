@@ -18,8 +18,9 @@ use crate::trae_instance;
 use crate::trae_machine;
 
 #[tauri::command]
-pub fn get_accounts(state: State<'_, AppState>) -> Vec<PublicAccount> {
-    build_account_views(&state)
+pub async fn get_accounts(state: State<'_, AppState>) -> AppResult<Vec<PublicAccount>> {
+    // async:内部要逐个实例读 storage.json,同步命令会跑在主线程上阻塞界面
+    Ok(build_account_views(&state))
 }
 
 /// 构建账号视图:聚合 device_map / 冷却 / 剩余积分 / JWT 状态 / 今日签到(对应参考 build_account_views)。
@@ -792,6 +793,15 @@ fn bound_dir_usable(account: &Account) -> bool {
 /// 启动账号独立实例(前端命令与托盘点击共用核心逻辑):
 /// 解密凭据 -> 解析 exe -> 启动 -> 回写 data_dir/machine_id -> 刷新托盘菜单
 pub fn launch_account_by_id(app: &AppHandle, account_id: &str) -> AppResult<LaunchResult> {
+    launch_account_by_id_entry(app, account_id, "tray")
+}
+
+/// 同上,额外记录打开事件来源(card = 账号卡片按钮 / tray = 托盘菜单)
+fn launch_account_by_id_entry(
+    app: &AppHandle,
+    account_id: &str,
+    entry: &str,
+) -> AppResult<LaunchResult> {
     let state = app.state::<AppState>();
     // 1. 取账号
     let account = {
@@ -846,6 +856,12 @@ pub fn launch_account_by_id(app: &AppHandle, account_id: &str) -> AppResult<Laun
             Some(&shared_ext),
         )?;
         let _ = crate::rebuild_tray_menu(app);
+        append_activity(
+            state.inner(),
+            account_id,
+            account.desktop_user_id.as_deref(),
+            entry,
+        );
         return Ok(LaunchResult {
             data_dir: main_dir.to_string_lossy().to_string(),
             machine_id: String::new(),
@@ -901,13 +917,20 @@ pub fn launch_account_by_id(app: &AppHandle, account_id: &str) -> AppResult<Laun
     // 6. 刷新托盘菜单:新实例已运行,状态前缀更新
     let _ = crate::rebuild_tray_menu(app);
 
+    append_activity(
+        state.inner(),
+        account_id,
+        account.desktop_user_id.as_deref(),
+        entry,
+    );
+
     Ok(result)
 }
 
 /// 启动账号独立实例(前端命令入口)
 #[tauri::command]
 pub fn launch_account_multi(id: String, app: AppHandle) -> AppResult<LaunchResult> {
-    launch_account_by_id(&app, &id)
+    launch_account_by_id_entry(&app, &id, "card")
 }
 
 /// 获取已保存的 TRAE exe 路径(未设置返回 None)
@@ -977,6 +1000,280 @@ pub fn get_account_instance_state(
         source,
         is_main_account,
     })
+}
+
+/// 批量查询所有账号的实例运行状态:probe_main_instance 只调一次,
+/// 避免前端每个卡片各调一次 get_account_instance_state 造成 N 次进程扫描(切页签卡顿的根因)。
+#[tauri::command]
+pub async fn get_all_instance_states(
+    state: State<'_, AppState>,
+) -> AppResult<serde_json::Value> {
+    // async:每个账号都要 tasklist 校验进程,同步命令会阻塞界面主线程
+    let accounts = {
+        let data = state.data.lock().unwrap();
+        data.get_accounts().to_vec()
+    };
+    let main = trae_machine::probe_main_instance();
+    let mut map = serde_json::Map::new();
+    for account in &accounts {
+        let source = trae_machine::account_state(account, &main);
+        let is_main_account = main.1.as_deref()
+            == account
+                .desktop_user_id
+                .as_deref()
+                .filter(|s| !s.is_empty());
+        let st = InstanceState {
+            running: !matches!(source, trae_machine::InstanceSource::None),
+            source,
+            is_main_account,
+        };
+        if let Ok(v) = serde_json::to_value(st) {
+            map.insert(account.id.clone(), v);
+        }
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
+// ===== A55:账号活动(打开事件 / 标签 / 最近项目) =====
+
+/// 打开事件文件最多保留的条数(超出丢最旧)
+const ACTIVITY_MAX_EVENTS: usize = 1000;
+
+/// 标签规范化:去空白、去重、单标签 ≤24 字符、最多 8 个;超限返回中文错误
+fn normalize_tags(tags: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in tags {
+        let t = t.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t.chars().count() > 24 {
+            return Err(format!("标签「{t}」超过 24 个字符"));
+        }
+        if !out.iter().any(|x| x == t) {
+            out.push(t.to_string());
+        }
+    }
+    if out.len() > 8 {
+        return Err("标签最多 8 个".to_string());
+    }
+    Ok(out)
+}
+
+/// 事件裁剪:只保留最近 1000 条
+fn trim_events(mut events: Vec<crate::models::ActivityEvent>) -> Vec<crate::models::ActivityEvent> {
+    if events.len() > ACTIVITY_MAX_EVENTS {
+        let drop = events.len() - ACTIVITY_MAX_EVENTS;
+        events.drain(0..drop);
+    }
+    events
+}
+
+/// 追加一条打开事件;写盘失败只记日志,不影响启动主流程
+fn append_activity(
+    state: &AppState,
+    account_id: &str,
+    desktop_user_id: Option<&str>,
+    entry: &str,
+) {
+    let path = state.data_path("account_activity.json");
+    let mut file: crate::models::AccountActivityFile = crate::fs_utils::read_json(&path);
+    file.events.push(crate::models::ActivityEvent {
+        account_id: account_id.to_string(),
+        desktop_user_id: desktop_user_id.map(str::to_string),
+        at: now_ms(),
+        entry: entry.to_string(),
+    });
+    file.events = trim_events(file.events);
+    if let Err(e) = crate::fs_utils::write_json(&path, &file) {
+        crate::fs_utils::app_log(&state.data_dir, &format!("写入账号活动失败: {e}"));
+    }
+}
+
+/// 毫秒时间戳 → Asia/Shanghai 自然日
+fn shanghai_date(ms: i64) -> chrono::NaiveDate {
+    use chrono::TimeZone;
+    chrono::Utc
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|dt| dt.with_timezone(&chrono_tz::Asia::Shanghai).date_naive())
+        .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+}
+
+/// 近 30 天(含今天)打开次数,按 Asia/Shanghai 自然日划分
+fn count_opens_30d(events: &[crate::models::ActivityEvent], account_id: &str, now: i64) -> u32 {
+    let today = shanghai_date(now);
+    let from = today - chrono::Duration::days(29);
+    events
+        .iter()
+        .filter(|e| e.account_id == account_id)
+        .filter(|e| {
+            let d = shanghai_date(e.at);
+            d >= from && d <= today
+        })
+        .count() as u32
+}
+
+/// file:// URI → 本地路径(百分号解码;Windows 去掉首个 '/')
+fn decode_file_uri(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    let mut bytes: Vec<u8> = Vec::with_capacity(rest.len());
+    let chars: Vec<char> = rest.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '%' && i + 2 < chars.len() {
+            let hex: String = chars[i + 1..i + 3].iter().collect();
+            if let Ok(b) = u8::from_str_radix(&hex, 16) {
+                bytes.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        let mut buf = [0u8; 4];
+        bytes.extend_from_slice(chars[i].encode_utf8(&mut buf).as_bytes());
+        i += 1;
+    }
+    let s = String::from_utf8_lossy(&bytes).to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// 从 workspace.json 取项目路径:优先 "workspace"(file:// URI),其次 "folder"
+fn project_path_from_workspace_json(raw: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    for key in ["workspace", "folder"] {
+        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+            let t = s.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if let Some(p) = decode_file_uri(t) {
+                return Some(p);
+            }
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
+/// 该账号实例的最近项目(按 workspace.json 所在目录 mtime 倒序,最多 5 条)
+fn account_projects(data_dir: Option<&str>) -> Vec<serde_json::Value> {
+    let Some(dir) = data_dir.filter(|d| !d.is_empty()) else {
+        return Vec::new();
+    };
+    let ws_root = Path::new(dir).join("User").join("workspaceStorage");
+    let Ok(entries) = std::fs::read_dir(&ws_root) else {
+        return Vec::new();
+    };
+    let mut items: Vec<(i64, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let ws_dir = entry.path();
+        let ws_json = ws_dir.join("workspace.json");
+        let Ok(raw) = std::fs::read_to_string(&ws_json) else {
+            continue;
+        };
+        let Some(path) = project_path_from_workspace_json(&raw) else {
+            continue;
+        };
+        let mtime = std::fs::metadata(&ws_dir)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        items.push((mtime, path));
+    }
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    items
+        .into_iter()
+        .take(5)
+        .map(|(mtime, path)| serde_json::json!({ "path": path, "lastActive": mtime }))
+        .collect()
+}
+
+/// 账号活动聚合:最近打开时间 / 近 30 天次数 / 最近项目 + 时间线事件
+#[tauri::command]
+pub async fn account_activity_list(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
+    // async:要遍历各实例 workspaceStorage 取项目,同步命令会卡住界面
+    let accounts = {
+        let data = state.data.lock().unwrap();
+        data.get_accounts().to_vec()
+    };
+    let activity: crate::models::AccountActivityFile =
+        crate::fs_utils::read_json(&state.data_path("account_activity.json"));
+    let now = now_ms();
+
+    let mut list: Vec<serde_json::Value> = Vec::new();
+    for a in &accounts {
+        let last_opened = activity
+            .events
+            .iter()
+            .filter(|e| e.account_id == a.id)
+            .map(|e| e.at)
+            .max();
+        list.push(serde_json::json!({
+            "id": a.id,
+            "name": a.name,
+            "enabled": a.enabled,
+            "tags": a.tags,
+            "lastOpenedAt": last_opened,
+            "openCount30d": count_opens_30d(&activity.events, &a.id, now),
+            "projects": account_projects(a.data_dir.as_deref()),
+        }));
+    }
+
+    // 时间线:最近 200 条事件(前端按 at 倒序渲染)
+    let mut events: Vec<&crate::models::ActivityEvent> = activity.events.iter().collect();
+    events.sort_by(|a, b| b.at.cmp(&a.at));
+    let timeline: Vec<serde_json::Value> = events
+        .into_iter()
+        .take(200)
+        .map(|e| {
+            let name = accounts
+                .iter()
+                .find(|a| a.id == e.account_id)
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| e.account_id.clone());
+            let tags = accounts
+                .iter()
+                .find(|a| a.id == e.account_id)
+                .map(|a| a.tags.clone())
+                .unwrap_or_default();
+            serde_json::json!({
+                "accountId": e.account_id,
+                "name": name,
+                "tags": tags,
+                "at": e.at,
+                "entry": e.entry,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "accounts": list,
+        "events": timeline,
+        "generatedAt": crate::fs_utils::now_iso(),
+    }))
+}
+
+/// 更新账号标签(手动维护的用途标签)
+#[tauri::command]
+pub fn update_account_tags(
+    id: String,
+    tags: Vec<String>,
+    state: State<'_, AppState>,
+) -> AppResult<PublicAccount> {
+    let clean = normalize_tags(&tags).map_err(AppError::Launch)?;
+    let mut data = state.data.lock().unwrap();
+    let acc = data
+        .update_account(&id, serde_json::json!({ "tags": clean }))
+        .ok_or_else(|| AppError::NotFound(id.clone()))?;
+    data.save(&state.path)?;
+    Ok(acc.into())
 }
 
 /// 聚焦账号实例窗口:工具实例运行聚焦其 data-dir 窗口,主实例运行聚焦主目录窗口,未运行则报错。
@@ -2191,6 +2488,55 @@ mod tests {
         assert_eq!(got, mid, "独立值必须原样保留");
         assert_eq!(fs::read(&path).unwrap(), before, "文件字节不得改动");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A55:旧账号 JSON 无 tags 字段时必须能反序列化(空数组)
+    #[test]
+    fn account_without_tags_deserializes_to_empty() {
+        let legacy = r#"{"id":"a1","name":"老号","cookie":"","createdAt":1,"enabled":true}"#;
+        let acc: Account = serde_json::from_str(legacy).unwrap();
+        assert!(acc.tags.is_empty(), "缺失 tags 必须回退为空数组");
+    }
+
+    /// A55:近 30 天次数按 Asia/Shanghai 自然日窗口统计(含今天,排除 30 天前)
+    #[test]
+    fn open_count_uses_30_day_window() {
+        let day = 86_400_000i64;
+        let now = chrono::Utc::now().timestamp_millis();
+        let ev = |ms: i64| crate::models::ActivityEvent {
+            account_id: "a1".to_string(),
+            desktop_user_id: None,
+            at: ms,
+            entry: "card".to_string(),
+        };
+        let events = vec![
+            ev(now),
+            ev(now - 10 * day),
+            ev(now - 29 * day),
+            ev(now - 30 * day),
+            ev(now - 60 * day),
+        ];
+        assert_eq!(count_opens_30d(&events, "a1", now), 3, "今天 + 10 天前 + 29 天前");
+        assert_eq!(count_opens_30d(&events, "other", now), 0, "其它账号不计入");
+    }
+
+    /// A55:事件超 1000 条时只保留最近 1000 条(丢最旧)
+    #[test]
+    fn activity_events_are_capped_at_1000() {
+        let events: Vec<crate::models::ActivityEvent> = (0..1005)
+            .map(|i| crate::models::ActivityEvent {
+                account_id: format!("a{i}"),
+                desktop_user_id: None,
+                at: i as i64,
+                entry: "card".to_string(),
+            })
+            .collect();
+
+        let trimmed = trim_events(events);
+
+        assert_eq!(trimmed.len(), 1000, "必须裁剪到 1000 条");
+        assert_eq!(trimmed.first().unwrap().at, 5, "丢最旧 5 条");
+        assert_eq!(trimmed.last().unwrap().at, 1004, "保留最新");
     }
 
     /// A42①:只有 cloudide 键 → 已登录

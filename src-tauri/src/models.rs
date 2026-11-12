@@ -82,6 +82,9 @@ pub struct Account {
     pub cooldown_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub checked_today: Option<bool>,
+    /// 用途/项目标签(手动维护,如「Anki分析」「视频下载器」)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 /// 账号(脱敏,返回前端)。不含加密凭据。
@@ -118,6 +121,7 @@ pub struct PublicAccount {
     pub cooldown_until: Option<i64>,
     pub cooldown_reason: Option<String>,
     pub checked_today: Option<bool>,
+    pub tags: Vec<String>,
 }
 
 impl From<Account> for PublicAccount {
@@ -152,8 +156,30 @@ impl From<Account> for PublicAccount {
             cooldown_until: a.cooldown_until,
             cooldown_reason: a.cooldown_reason,
             checked_today: a.checked_today,
+            tags: a.tags,
         }
     }
+}
+
+/// 账号打开事件(account_activity.json):用于「账号活动」页的最近打开/次数/时间线
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityEvent {
+    pub account_id: String,
+    #[serde(default)]
+    pub desktop_user_id: Option<String>,
+    /// 毫秒时间戳
+    pub at: i64,
+    /// 入口:"card"(账号卡片) | "tray"(托盘) | "launch"(其它)
+    pub entry: String,
+}
+
+/// 账号打开事件文件
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountActivityFile {
+    #[serde(default)]
+    pub events: Vec<ActivityEvent>,
 }
 
 /// 签到日志

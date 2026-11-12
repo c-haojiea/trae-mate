@@ -72,6 +72,17 @@
           class="nav-item"
           role="button"
           tabindex="0"
+          :class="{ active: activeTab === 'activity' }"
+          @click="activeTab = 'activity'"
+          @keydown.enter="activeTab = 'activity'"
+        >
+          <span class="nav-icon"><Icon name="clock" :size="18" /></span>
+          <span>账号活动</span>
+        </div>
+        <div
+          class="nav-item"
+          role="button"
+          tabindex="0"
           :class="{ active: activeTab === 'unlogged' }"
           @click="activeTab = 'unlogged'"
           @keydown.enter="activeTab = 'unlogged'"
@@ -124,6 +135,7 @@
           <p class="page-subtitle" v-if="activeTab === 'accounts'">管理你的 Trae Work 账号，一键签到</p>
           <p class="page-subtitle" v-else-if="activeTab === 'credits'">今日消耗、按账号消耗与历史累计</p>
           <p class="page-subtitle" v-else-if="activeTab === 'logs'">查看所有签到记录和结果</p>
+          <p class="page-subtitle" v-else-if="activeTab === 'activity'">最近打开过的账号与用途标签</p>
           <p class="page-subtitle" v-else-if="activeTab === 'unlogged'">实例登录态失效的账号集中处理</p>
           <p class="page-subtitle" v-else>配置自动签到和通知设置</p>
         </div>
@@ -171,13 +183,16 @@
         <button class="btn btn-sm btn-outline" @click="activeTab = 'unlogged'">前往处理</button>
       </div>
 
-      <!-- 内容区域 -->
+      <!-- 内容区域:KeepAlive 缓存各页签,避免来回切换重复拉数据/重复扫描进程 -->
       <div class="content-area">
-        <AccountList v-if="activeTab === 'accounts'" @add-account="showAddModal = true" @notify="showToast" />
-        <CreditsBoard v-else-if="activeTab === 'credits'" :as-page="true" @notify="showToast" />
-        <CheckinLog v-else-if="activeTab === 'logs'" />
-        <UnloggedAccounts v-else-if="activeTab === 'unlogged'" @notify="showToast" />
-        <SettingsPanel v-else @notify="showToast" />
+        <KeepAlive>
+          <component
+            :is="currentPage"
+            v-bind="currentPageProps"
+            @notify="showToast"
+            @add-account="showAddModal = true"
+          />
+        </KeepAlive>
       </div>
     </main>
     </div><!-- /app-body -->
@@ -202,12 +217,13 @@ import SettingsPanel from './components/SettingsPanel.vue'
 import AddAccountModal from './components/AddAccountModal.vue'
 import CreditsBoard from './components/CreditsBoard.vue'
 import UnloggedAccounts from './components/UnloggedAccounts.vue'
+import ActivityPanel from './components/ActivityPanel.vue'
 import Icon from './components/Icon.vue'
 
 const appWindow = getCurrentWindow()
 
 const store = useAppStore()
-const activeTab = ref<'accounts' | 'credits' | 'logs' | 'unlogged' | 'settings'>('accounts')
+const activeTab = ref<'accounts' | 'credits' | 'logs' | 'activity' | 'unlogged' | 'settings'>('accounts')
 const showAddModal = ref(false)
 const toastMessage = ref('')
 const toastType = ref<'success' | 'error'>('success')
@@ -266,11 +282,29 @@ const currentPageTitle = computed(() => {
     case 'accounts': return '账号管理'
     case 'credits': return '积分看板'
     case 'logs': return '签到日志'
+    case 'activity': return '账号活动'
     case 'unlogged': return '实例未登录'
     case 'settings': return '设置'
     default: return ''
   }
 })
+
+// 页签 → 组件(配合 KeepAlive 缓存,切换不重新挂载/重复请求)
+const currentPage = computed(() => {
+  switch (activeTab.value) {
+    case 'accounts': return AccountList
+    case 'credits': return CreditsBoard
+    case 'logs': return CheckinLog
+    case 'activity': return ActivityPanel
+    case 'unlogged': return UnloggedAccounts
+    default: return SettingsPanel
+  }
+})
+
+// 仅积分看板作为整页时需要 asPage
+const currentPageProps = computed(() =>
+  activeTab.value === 'credits' ? { asPage: true } : {}
+)
 
 // 可用账号(排除实例未登录的);侧栏徽标与账号管理页都用它
 const usableCount = computed(() => store.accounts.filter((a) => a.instanceLoggedIn !== false).length)

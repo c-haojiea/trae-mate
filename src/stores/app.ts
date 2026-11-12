@@ -36,6 +36,8 @@ export interface Account {
   cooldownUntil?: number
   cooldownReason?: string
   checkedToday?: boolean
+  /** 用途/项目标签(手动维护) */
+  tags?: string[]
 }
 
 export interface CheckinLog {
@@ -129,6 +131,37 @@ export interface InstanceDirInfo {
   bound: boolean
 }
 
+export interface ActivityProject {
+  path: string
+  lastActive: number
+}
+
+/** 「账号活动」页的账号条目 */
+export interface ActivityAccount {
+  id: string
+  name: string
+  enabled: boolean
+  tags: string[]
+  lastOpenedAt: number | null
+  openCount30d: number
+  projects: ActivityProject[]
+}
+
+/** 时间线事件(按 at 倒序) */
+export interface ActivityTimelineEvent {
+  accountId: string
+  name: string
+  tags: string[]
+  at: number
+  entry: string
+}
+
+export interface ActivityPayload {
+  accounts: ActivityAccount[]
+  events: ActivityTimelineEvent[]
+  generatedAt: string
+}
+
 export interface AppSettings {
   autoCheckin: boolean
   checkinTime: string
@@ -163,6 +196,10 @@ export const useAppStore = defineStore('app', () => {
   const launching = ref(false) // 多开启动中
   const waitingLogin = ref(false) // 等待新实例登录导入(打开新实例登录后置 true,login-imported 事件后置 false)
   const instanceRefreshTick = ref(0) // 多开状态刷新信号:自增触发各卡片重查
+  // 批量实例状态缓存(一次 IPC 取全部账号,避免每卡片各扫一次进程)
+  const instanceStates = ref<Record<string, InstanceState>>({})
+  let lastBatchAt = 0 // 上次批量拉取时间(节流用)
+  let batchInflight: Promise<Record<string, InstanceState>> | null = null
   const nextRunTime = ref<string | null>(null)
   const checkinProgress = ref<Record<string, CheckinProgressEvent>>({}) // 一键签到实时进度(按 user_id 索引)
   const checkinTotal = ref(0)
@@ -174,6 +211,10 @@ export const useAppStore = defineStore('app', () => {
   const consumedByUidDate = ref<string | null>(null)
   // 按账号可归属历史累计
   const consumedByUidHistory = ref<ConsumedByUidHistory | null>(null)
+  // 「账号活动」页数据(打开事件聚合 + 最近项目)
+  const activityAccounts = ref<ActivityAccount[]>([])
+  const activityEvents = ref<ActivityTimelineEvent[]>([])
+  const activityGeneratedAt = ref<string | null>(null)
 
   // 计算属性
   const enabledAccounts = computed(() => accounts.value.filter(a => a.enabled))
@@ -194,6 +235,8 @@ export const useAppStore = defineStore('app', () => {
     try {
       const result = await invoke<Account[]>('get_accounts')
       accounts.value = result || []
+      // 账号集合变化时同步刷新批量实例状态缓存(单次 IPC)
+      await fetchAllInstanceStates()
     } catch (e) {
       console.error('获取账号列表失败:', e)
     }
@@ -382,8 +425,36 @@ export const useAppStore = defineStore('app', () => {
     return result
   }
 
+  // 批量拉取全部账号实例状态(单次 IPC,内部只探测一次主实例)
+  // 并发调用共享同一个 in-flight 请求,避免 N 张卡片同时各发一次
+  async function fetchAllInstanceStates() {
+    if (batchInflight) return batchInflight
+    batchInflight = (async () => {
+      try {
+        const res = await invoke<Record<string, InstanceState>>('get_all_instance_states')
+        instanceStates.value = res || {}
+        lastBatchAt = Date.now()
+        return instanceStates.value
+      } catch (e) {
+        console.error('批量查询实例状态失败:', e)
+        return instanceStates.value
+      } finally {
+        batchInflight = null
+      }
+    })()
+    return batchInflight
+  }
+
   // 查询账号实例运行状态(含来源:主实例/工具实例/未运行)
+  // 优先读批量缓存;缓存为空先批量拉一次;缓存命中时后台按 5 秒节流刷新(保持卡片轮询能感知实例关闭)
   async function getInstanceState(id: string): Promise<InstanceState> {
+    const empty = Object.keys(instanceStates.value).length === 0
+    if (empty) {
+      await fetchAllInstanceStates()
+    } else if (Date.now() - lastBatchAt > 5000) {
+      void fetchAllInstanceStates()
+    }
+    if (instanceStates.value[id]) return instanceStates.value[id]
     try {
       return await invoke<InstanceState>('get_account_instance_state', { id })
     } catch (e) {
@@ -392,8 +463,9 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
-  // 触发所有账号卡片重新查询多开实例运行状态(关闭实例后状态不自动更新,手动刷新用)
-  function refreshInstances() {
+  // 刷新所有账号的实例运行状态(关闭实例后状态不自动更新,手动刷新用)
+  async function refreshInstances() {
+    await fetchAllInstanceStates()
     instanceRefreshTick.value++
   }
 
@@ -487,6 +559,35 @@ export const useAppStore = defineStore('app', () => {
     return invoke<string[]>('credits_export_csv')
   }
 
+  // ===== 账号活动(A55) =====
+
+  // 拉取「账号活动」数据(打开事件聚合 + 最近项目 + 时间线)
+  async function fetchAccountActivity() {
+    try {
+      const res = await invoke<ActivityPayload>('account_activity_list')
+      activityAccounts.value = res?.accounts || []
+      activityEvents.value = res?.events || []
+      activityGeneratedAt.value = res?.generatedAt ?? null
+      return res
+    } catch (e) {
+      console.error('获取账号活动失败:', e)
+      return null
+    }
+  }
+
+  // 更新账号用途标签(后端会去空白/去重/限长)
+  async function updateAccountTags(id: string, tags: string[]) {
+    const acc = await invoke<Account>('update_account_tags', { id, tags })
+    const idx = accounts.value.findIndex((a) => a.id === id)
+    if (idx >= 0) accounts.value[idx] = { ...accounts.value[idx], ...acc }
+    const aidx = activityAccounts.value.findIndex((a) => a.id === id)
+    if (aidx >= 0) activityAccounts.value[aidx] = { ...activityAccounts.value[aidx], tags: acc.tags || [] }
+    activityEvents.value = activityEvents.value.map((e) =>
+      e.accountId === id ? { ...e, tags: acc.tags || [] } : e
+    )
+    return acc
+  }
+
   // 初始化
   async function init() {
     loading.value = true
@@ -528,6 +629,7 @@ export const useAppStore = defineStore('app', () => {
     launching,
     waitingLogin,
     instanceRefreshTick,
+    instanceStates,
     nextRunTime,
     checkinProgress,
     checkinTotal,
@@ -536,6 +638,9 @@ export const useAppStore = defineStore('app', () => {
     consumedByUidToday,
     consumedByUidDate,
     consumedByUidHistory,
+    activityAccounts,
+    activityEvents,
+    activityGeneratedAt,
     // 计算属性
     enabledAccounts,
     todayCheckedCount,
@@ -559,8 +664,11 @@ export const useAppStore = defineStore('app', () => {
     importAccountFromDir,
     refreshCredential,
     getInstanceState,
+    fetchAllInstanceStates,
     focusInstance,
     refreshInstances,
+    fetchAccountActivity,
+    updateAccountTags,
     getTraeExePath,
     setTraeExePath,
     scanTraeExePath,
