@@ -22,6 +22,9 @@ use tauri::{
     AppHandle, Emitter, Manager,
 };
 
+/// 托盘菜单刷新周期:只为感知外部关闭实例;账号增删/启停/启动实例时另有即时刷新
+const TRAY_REFRESH_SECS: u64 = 60;
+
 /// 重建系统托盘右键菜单:列出全部账号(● 运行中 / ○ 未运行,点击启动或聚焦)+ 一键签到 + 退出。
 /// 在启动、删除账号、以及定时(感知外部关闭)时调用。
 pub fn rebuild_tray_menu(app: &AppHandle) {
@@ -224,12 +227,16 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // 初始构建动态托盘菜单,并启动定时刷新(感知多开实例外部关闭,10s 一次)
+            // 初始构建动态托盘菜单,并启动定时刷新(感知多开实例外部关闭,60s 一次)
             rebuild_tray_menu(app.handle());
             {
                 let app_handle = app.handle().clone();
                 std::thread::spawn(move || loop {
-                    std::thread::sleep(std::time::Duration::from_secs(10));
+                    std::thread::sleep(std::time::Duration::from_secs(TRAY_REFRESH_SECS));
+                    // 主窗口已销毁说明应用正在退出,停止空转
+                    if app_handle.get_webview_window("main").is_none() {
+                        break;
+                    }
                     rebuild_tray_menu(&app_handle);
                 });
             }
