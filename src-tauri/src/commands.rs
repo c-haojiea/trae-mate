@@ -1134,7 +1134,28 @@ pub fn open_new_login_instance(app: AppHandle) -> AppResult<()> {
         .to_string_lossy()
         .to_string();
 
-    // 启动空白实例(不写凭据,用户自行登录)
+    // 启动空白实例(不写凭据,用户自行登录):本次只为生成目录结构与 storage.json
+    trae_machine::open_product_with_data_dir(&exe_path, &temp_dir, Some(&shared_ext))?;
+
+    // 登录前定型设备身份:等 storage.json → 关实例 → 写入独立 mid → 再启动。
+    // 否则令牌会以机器常量签发,落盘却被改成别的值,续期必被判 20403。
+    let appdata_path = PathBuf::from(&appdata);
+    let account_machine_ids = {
+        let state = app.state::<AppState>();
+        let data = state.data.lock().unwrap();
+        data.get_accounts()
+            .iter()
+            .filter_map(|a| a.machine_id.as_deref())
+            .map(str::to_string)
+            .collect::<Vec<String>>()
+    };
+    if let Err(e) = preset_instance_machine_mid(&appdata_path, &temp_dir, &account_machine_ids) {
+        return Err(AppError::Launch(format!(
+            "预置设备身份失败: {e}；临时目录已保留：{temp_dir}"
+        )));
+    }
+
+    // 用定型后的身份重新启动,供用户登录
     trae_machine::open_product_with_data_dir(&exe_path, &temp_dir, Some(&shared_ext))?;
 
     // 后台轮询登录 + 导入,完成后 emit 事件
@@ -1334,6 +1355,16 @@ fn should_assign_machine_mid(is_new_account: bool, credential_copied: bool) -> b
 /// - 账号库全部账号的 machineId 字段
 /// 不用 trae_instance::scan_instance_dirs:它会跳过无凭据目录,会漏掉 login 残留目录。
 fn collect_used_machine_ids(appdata: &Path, extra: &[String]) -> std::collections::HashSet<String> {
+    collect_used_machine_ids_excluding(appdata, extra, None)
+}
+
+/// 同上,但可排除目标目录自身(它的 mid 不应算作「已被别人占用」,
+/// 否则幂等判断永远失败,预设好的值会被二次覆盖)。
+fn collect_used_machine_ids_excluding(
+    appdata: &Path,
+    extra: &[String],
+    exclude_dir: Option<&Path>,
+) -> std::collections::HashSet<String> {
     use std::collections::HashSet;
     let mut used: HashSet<String> = HashSet::new();
     for m in extra {
@@ -1353,6 +1384,11 @@ fn collect_used_machine_ids(appdata: &Path, extra: &[String]) -> std::collection
             continue;
         }
         let dir = entry.path();
+        if let Some(ex) = exclude_dir {
+            if dir == ex {
+                continue;
+            }
+        }
         let storage = dir.join("User").join("globalStorage").join("storage.json");
         if let Ok(raw) = std::fs::read_to_string(&storage) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
@@ -1374,20 +1410,58 @@ fn collect_used_machine_ids(appdata: &Path, extra: &[String]) -> std::collection
     used
 }
 
-/// 为新账号实例分配独立 telemetry.machineId(sha256 → 64 位小写 hex),与全机任一已用值不冲突。
-/// 只改 storage.json 的这一个键,其余键(devDeviceId / sqmId / 凭据)一字不动;
-/// machineid 文件与账号库 machine_id 不碰。写盘走 JSON 解析 + 序列化,失败不改文件。
-fn assign_new_instance_machine_mid(
+/// 空目录首启时 TRAE 写入的机器常量 mid:多账号共用会触发 4017,必须替换。
+const TELEMETRY_MID_MACHINE_CONSTANT: &str =
+    "0929e143d12044ec627feb22117a9379a2026161b6ae6efbc90b825aa19d9c5b";
+
+/// 是否为「独立」的 telemetry.machineId:64 位小写 hex、不等于机器常量、且未被其他目录/账号占用。
+fn is_independent_machine_mid(
+    mid: &str,
+    used: &std::collections::HashSet<String>,
+) -> bool {
+    let t = mid.trim();
+    t.len() == 64
+        && t.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        && t != TELEMETRY_MID_MACHINE_CONSTANT
+        && !used.contains(t)
+}
+
+/// 确保目标实例的 telemetry.machineId 为独立值:
+/// 已是独立值 → 原样返回(不重写,幂等);否则生成新值并只改这一个键。
+/// 返回 (最终 mid, 是否发生了写入)。
+fn ensure_independent_machine_mid(
     appdata: &Path,
     data_dir: &str,
     account_machine_ids: &[String],
-) -> Result<String, String> {
-    let used = collect_used_machine_ids(appdata, account_machine_ids);
+) -> Result<(String, bool), String> {
+    let dir = Path::new(data_dir);
+    let storage = dir.join("User").join("globalStorage").join("storage.json");
+    let raw = std::fs::read_to_string(&storage)
+        .map_err(|e| format!("读取目标 storage.json 失败: {e}"))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("目标 storage.json 解析失败: {e}"))?;
+    if !value.is_object() {
+        return Err("目标 storage.json 不是 JSON 对象,未写入".into());
+    }
+
+    // 排除目标目录自身:它的当前值不应算「被占用」
+    let used =
+        collect_used_machine_ids_excluding(appdata, account_machine_ids, Some(dir));
+    let current = value
+        .get("telemetry.machineId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if is_independent_machine_mid(&current, &used) {
+        return Ok((current, false));
+    }
+
     let mut candidate = String::new();
     let mut found = false;
     for _ in 0..8 {
         candidate = trae_machine::telemetry_machine_id(&uuid::Uuid::new_v4().to_string());
-        if !used.contains(&candidate) {
+        if is_independent_machine_mid(&candidate, &used) {
             found = true;
             break;
         }
@@ -1396,14 +1470,6 @@ fn assign_new_instance_machine_mid(
         return Err("连续 8 次生成的 telemetry.machineId 均与全机已用值冲突".into());
     }
 
-    let storage = Path::new(data_dir)
-        .join("User")
-        .join("globalStorage")
-        .join("storage.json");
-    let raw = std::fs::read_to_string(&storage)
-        .map_err(|e| format!("读取目标 storage.json 失败: {e}"))?;
-    let mut value: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("目标 storage.json 解析失败: {e}"))?;
     let Some(obj) = value.as_object_mut() else {
         return Err("目标 storage.json 不是 JSON 对象,未写入".into());
     };
@@ -1414,7 +1480,60 @@ fn assign_new_instance_machine_mid(
     let text = serde_json::to_string_pretty(&value)
         .map_err(|e| format!("序列化目标 storage.json 失败: {e}"))?;
     std::fs::write(&storage, text).map_err(|e| format!("写入目标 storage.json 失败: {e}"))?;
-    Ok(candidate)
+    Ok((candidate, true))
+}
+
+/// 新增账号登录前定型设备身份:等 storage.json 出现 → 关闭实例并等退出 → 写入独立 mid → 由调用方再启动。
+/// 这样令牌签发时上报的 mid 与最终落盘值一致,避免续期被判 20403。
+fn preset_instance_machine_mid(
+    appdata: &Path,
+    data_dir: &str,
+    account_machine_ids: &[String],
+) -> Result<String, String> {
+    let storage = Path::new(data_dir)
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+    // 1) 等 TRAE 首次启动写出 storage.json(最多 30 秒,每 300ms 一次)
+    let mut appeared = false;
+    for _ in 0..100 {
+        if storage.exists() {
+            appeared = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    if !appeared {
+        return Err("30 秒内未生成 storage.json".into());
+    }
+
+    // 2) 关闭该实例(kill_instance 内部有镜像名白名单校验,不会误杀)
+    let _ = trae_machine::kill_instance(data_dir);
+
+    // 3) 等实例退出(最多 10 秒,每 500ms 一次;is_instance_running 内部用 tasklist 校验进程身份)
+    for _ in 0..20 {
+        if !trae_machine::is_instance_running(data_dir).0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // 4) 已是独立值则保持不动,否则写入新值
+    let (mid, _written) = ensure_independent_machine_mid(appdata, data_dir, account_machine_ids)?;
+    Ok(mid)
+}
+
+/// 为新账号实例分配独立 telemetry.machineId(sha256 → 64 位小写 hex),与全机任一已用值不冲突。
+/// 已是独立值(例如 preset 已设好)则原样返回,不重写;
+/// 只改 storage.json 的这一个键,其余键(devDeviceId / sqmId / 凭据)一字不动;
+/// machineid 文件与账号库 machine_id 不碰。写盘走 JSON 解析 + 序列化,失败不改文件。
+fn assign_new_instance_machine_mid(
+    appdata: &Path,
+    data_dir: &str,
+    account_machine_ids: &[String],
+) -> Result<String, String> {
+    let (mid, _written) = ensure_independent_machine_mid(appdata, data_dir, account_machine_ids)?;
+    Ok(mid)
 }
 
 /// 手动刷新账号凭证(卡片"刷新凭证"按钮):实例目录回读 + ExchangeToken 刷新 + 回写
@@ -1993,6 +2112,84 @@ mod tests {
             assert!(used.contains(v), "必须收集 {v}");
         }
         assert!(!used.contains("MID-IN-OTHER"), "无关目录不得收集");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A53①:目标已是独立 mid → preset 幂等返回原值,文件字节不变
+    #[test]
+    fn preset_skips_when_mid_already_independent() {
+        let root = case_dir("a53_preset_keep");
+        let appdata = root.join("appdata");
+        fs::create_dir_all(&appdata).unwrap();
+        let target = appdata.join(format!("{} login 3333", trae_machine::DATA_DIR_NAME));
+        let mid = "ab".repeat(32);
+        write_storage(
+            &target,
+            &format!(
+                r#"{{"telemetry.machineId":"{mid}","telemetry.devDeviceId":"DEV","telemetry.sqmId":"SQM"}}"#
+            ),
+        );
+        let path = target.join("User").join("globalStorage").join("storage.json");
+        let before = fs::read(&path).unwrap();
+
+        let got = preset_instance_machine_mid(&appdata, &target.to_string_lossy(), &[]).unwrap();
+
+        assert_eq!(got, mid, "必须返回原有独立值");
+        assert_eq!(fs::read(&path).unwrap(), before, "文件字节不得改动");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A53②:机器常量 mid → preset 生成新值,且只改这一个键
+    #[test]
+    fn preset_replaces_constant_mid() {
+        let root = case_dir("a53_preset_constant");
+        let appdata = root.join("appdata");
+        fs::create_dir_all(&appdata).unwrap();
+        let target = appdata.join(format!("{} login 4444", trae_machine::DATA_DIR_NAME));
+        write_storage(
+            &target,
+            &format!(
+                r#"{{"telemetry.machineId":"{TELEMETRY_MID_MACHINE_CONSTANT}","telemetry.devDeviceId":"DEV","telemetry.sqmId":"SQM","keep.setting":"x"}}"#
+            ),
+        );
+
+        let got = preset_instance_machine_mid(&appdata, &target.to_string_lossy(), &[]).unwrap();
+
+        assert_ne!(got, TELEMETRY_MID_MACHINE_CONSTANT, "必须替换机器常量");
+        assert_eq!(got.len(), 64, "必须 64 位");
+        assert!(
+            got.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "必须全小写 hex: {got}"
+        );
+        let v = read_storage_json(&target);
+        assert_eq!(v["telemetry.machineId"], got, "文件内该键须已更新");
+        assert_eq!(v["telemetry.devDeviceId"], "DEV", "devDeviceId 不得改动");
+        assert_eq!(v["telemetry.sqmId"], "SQM", "sqmId 不得改动");
+        assert_eq!(v["keep.setting"], "x", "其余键不得改动");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A53③:assign 遇到已独立的值必须跳过(防止 preset 设定的值被二次覆盖)
+    #[test]
+    fn assign_skips_independent_mid() {
+        let root = case_dir("a53_assign_keep");
+        let appdata = root.join("appdata");
+        fs::create_dir_all(&appdata).unwrap();
+        let target = appdata.join(format!("{}_1014", trae_machine::DATA_DIR_NAME));
+        let mid = "cd".repeat(32);
+        write_storage(
+            &target,
+            &format!(r#"{{"telemetry.machineId":"{mid}"}}"#),
+        );
+        let path = target.join("User").join("globalStorage").join("storage.json");
+        let before = fs::read(&path).unwrap();
+
+        let got =
+            assign_new_instance_machine_mid(&appdata, &target.to_string_lossy(), &[]).unwrap();
+
+        assert_eq!(got, mid, "独立值必须原样保留");
+        assert_eq!(fs::read(&path).unwrap(), before, "文件字节不得改动");
         let _ = fs::remove_dir_all(&root);
     }
 
