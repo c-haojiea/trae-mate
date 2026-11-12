@@ -130,7 +130,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useAppStore, type Account, type InstanceState } from '../stores/app'
 
 const props = defineProps<{
@@ -151,28 +151,18 @@ const instanceState = ref<InstanceState>({ running: false, source: 'none', isMai
 const isJwt = computed(() => props.account.source === 'jwt')
 
 onMounted(async () => {
-  instanceState.value = await store.getInstanceState(props.account.id)
-  startInstancePoll()
+  const cached = store.instanceStates[props.account.id]
+  instanceState.value = cached || (await store.getInstanceState(props.account.id))
 })
 
-// 定期轮询实例状态:用户可能在本应用之外关闭 TRAE 窗口,需及时把「聚焦」还原成「启动」
-let pollTimer: number | undefined
-function startInstancePoll() {
-  stopInstancePoll()
-  pollTimer = window.setInterval(async () => {
-    if (instanceState.value.source === 'none') return // 未运行时不轮询,避免无谓开销
-    const s = await store.getInstanceState(props.account.id)
-    instanceState.value = s
-    if (s.source === 'none') stopInstancePoll()
-  }, 5000)
-}
-function stopInstancePoll() {
-  if (pollTimer !== undefined) {
-    window.clearInterval(pollTimer)
-    pollTimer = undefined
-  }
-}
-onUnmounted(stopInstancePoll)
+// 实例状态由页面级集中轮询更新(store.instanceStates),卡片只做订阅
+watch(
+  () => store.instanceStates[props.account.id],
+  (v) => {
+    if (v) instanceState.value = v
+  },
+  { deep: true }
+)
 
 // 监听全局刷新信号(顶部"刷新"按钮触发),重新查询本账号实例运行状态(含主/工具来源)
 watch(() => store.instanceRefreshTick, async () => {
@@ -284,11 +274,13 @@ async function handleLaunchMulti() {
   try {
     await store.launchMulti(props.account.id)
     instanceState.value = { running: true, source: 'tool', isMainAccount: instanceState.value.isMainAccount }
-    startInstancePoll()
+    // 刷新批量缓存(轮询由页面级定时器负责,卡片不再自挂定时器)
+    void store.fetchAllInstanceStates()
     emit('notify', '实例已启动', 'success')
   } catch (e: any) {
     emit('notify', '启动失败: ' + (e?.message || e), 'error')
-    // 失败可能因状态过时(如该账号已在主实例运行),重新查询修正显示
+    // 失败可能因状态过时(如该账号已在主实例运行),强制刷一次缓存再修正显示
+    await store.fetchAllInstanceStates()
     instanceState.value = await store.getInstanceState(props.account.id)
   } finally {
     launching.value = false
@@ -299,11 +291,11 @@ async function handleFocus() {
   try {
     await store.focusInstance(props.account.id)
   } catch (e: any) {
-    // 实例可能已被用户在外部关闭:回查状态,让按钮自动还原为「启动」
+    // 实例可能已被用户在外部关闭:强制刷缓存后回查状态,让按钮自动还原为「启动」
+    await store.fetchAllInstanceStates()
     const s = await store.getInstanceState(props.account.id)
     instanceState.value = s
     if (s.source === 'none') {
-      stopInstancePoll()
       emit('notify', '该账号实例已关闭,按钮已还原为「启动」', 'success')
     } else {
       emit('notify', '聚焦失败: ' + (e?.message || e), 'error')

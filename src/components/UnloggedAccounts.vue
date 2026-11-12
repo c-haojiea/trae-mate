@@ -37,7 +37,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onActivated, onDeactivated, onMounted, ref, watch } from 'vue'
 import { useAppStore } from '../stores/app'
 import AccountCard from './AccountCard.vue'
 import Icon from './Icon.vue'
@@ -80,6 +80,10 @@ async function rescan() {
 onMounted(() => {
   lastScan.value = new Date()
 })
+
+// 该页也需要实例状态:激活时启轮询,切走即停
+onActivated(() => store.startInstanceStatePolling())
+onDeactivated(() => store.stopInstanceStatePolling())
 
 function handleNotify(message: string, type?: 'success' | 'error') {
   emit('notify', message, type)

@@ -198,7 +198,6 @@ export const useAppStore = defineStore('app', () => {
   const instanceRefreshTick = ref(0) // 多开状态刷新信号:自增触发各卡片重查
   // 批量实例状态缓存(一次 IPC 取全部账号,避免每卡片各扫一次进程)
   const instanceStates = ref<Record<string, InstanceState>>({})
-  let lastBatchAt = 0 // 上次批量拉取时间(节流用)
   let batchInflight: Promise<Record<string, InstanceState>> | null = null
   const nextRunTime = ref<string | null>(null)
   const checkinProgress = ref<Record<string, CheckinProgressEvent>>({}) // 一键签到实时进度(按 user_id 索引)
@@ -235,8 +234,8 @@ export const useAppStore = defineStore('app', () => {
     try {
       const result = await invoke<Account[]>('get_accounts')
       accounts.value = result || []
-      // 账号集合变化时同步刷新批量实例状态缓存(单次 IPC)
-      await fetchAllInstanceStates()
+      // 账号集合变化时同步刷新批量实例状态缓存(不阻塞列表渲染)
+      void fetchAllInstanceStates()
     } catch (e) {
       console.error('获取账号列表失败:', e)
     }
@@ -433,7 +432,6 @@ export const useAppStore = defineStore('app', () => {
       try {
         const res = await invoke<Record<string, InstanceState>>('get_all_instance_states')
         instanceStates.value = res || {}
-        lastBatchAt = Date.now()
         return instanceStates.value
       } catch (e) {
         console.error('批量查询实例状态失败:', e)
@@ -446,13 +444,10 @@ export const useAppStore = defineStore('app', () => {
   }
 
   // 查询账号实例运行状态(含来源:主实例/工具实例/未运行)
-  // 优先读批量缓存;缓存为空先批量拉一次;缓存命中时后台按 5 秒节流刷新(保持卡片轮询能感知实例关闭)
+  // 纯缓存读:命中直接返回;缓存为空才批量拉一次;后台轮询职责交给集中定时器
   async function getInstanceState(id: string): Promise<InstanceState> {
-    const empty = Object.keys(instanceStates.value).length === 0
-    if (empty) {
+    if (Object.keys(instanceStates.value).length === 0) {
       await fetchAllInstanceStates()
-    } else if (Date.now() - lastBatchAt > 5000) {
-      void fetchAllInstanceStates()
     }
     if (instanceStates.value[id]) return instanceStates.value[id]
     try {
@@ -460,6 +455,23 @@ export const useAppStore = defineStore('app', () => {
     } catch (e) {
       console.error('查询实例状态失败:', e)
       return { running: false, source: 'none', isMainAccount: false }
+    }
+  }
+
+  // 统一实例状态轮询(由账号管理页/实例未登录页在激活时启停,不做全局常驻)
+  const pollTimer = ref<number | null>(null)
+
+  function startInstanceStatePolling(intervalMs = 15000) {
+    stopInstanceStatePolling()
+    pollTimer.value = window.setInterval(() => {
+      void fetchAllInstanceStates()
+    }, intervalMs)
+  }
+
+  function stopInstanceStatePolling() {
+    if (pollTimer.value !== null) {
+      window.clearInterval(pollTimer.value)
+      pollTimer.value = null
     }
   }
 
@@ -665,6 +677,8 @@ export const useAppStore = defineStore('app', () => {
     refreshCredential,
     getInstanceState,
     fetchAllInstanceStates,
+    startInstanceStatePolling,
+    stopInstanceStatePolling,
     focusInstance,
     refreshInstances,
     fetchAccountActivity,

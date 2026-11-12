@@ -65,13 +65,18 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onActivated, onDeactivated, onMounted } from 'vue'
 import { useAppStore } from '../stores/app'
 import AccountCard from './AccountCard.vue'
 import Icon from './Icon.vue'
 
 const store = useAppStore()
 const emit = defineEmits(['add-account', 'notify'])
+
+// 页面激活期间才轮询实例状态(KeepAlive 场景下切走即停,避免常驻 tasklist)
+onMounted(() => store.startInstanceStatePolling())
+onActivated(() => store.startInstanceStatePolling())
+onDeactivated(() => store.stopInstanceStatePolling())
 
 // 只展示可用账号:instanceLoggedIn === false 的集中到「实例未登录」页
 const usableAccounts = computed(() =>
