@@ -168,7 +168,41 @@ export interface ActivityTimelineEvent {
 export interface ActivityPayload {
   accounts: ActivityAccount[]
   events: ActivityTimelineEvent[]
+  usageByAccount?: ActivityUsageAccount[]
+  usageDaily?: ActivityUsageDay[]
+  projectIndex?: ActivityProjectIndex[]
   generatedAt: string
+}
+
+/** 已关闭会话(时长统计口径:closedAt - at,>24h 截断并标 suspicious) */
+export interface ActivityUsageSession {
+  at: number
+  closedAt: number
+  durationMs: number
+  suspicious: boolean
+}
+
+export interface ActivityUsageAccount {
+  accountId: string
+  name: string
+  totalMs: number
+  sessionCount: number
+  sessions: ActivityUsageSession[]
+}
+
+export interface ActivityUsageDay {
+  date: string
+  openCount: number
+  closedCount: number
+  totalMs: number
+}
+
+/** 项目反向索引(各账号最近项目合并去重) */
+export interface ActivityProjectIndex {
+  path: string
+  name: string
+  accountIds: string[]
+  lastActive: number
 }
 
 /** UI 偏好(后端 ui_state.json):视图记忆与主题记忆 */
@@ -231,6 +265,10 @@ export const useAppStore = defineStore('app', () => {
   const activityGeneratedAt = ref<string | null>(null)
   // UI 偏好(后端持久化,解决 localStorage 跨进程不保留)
   const uiState = ref<UiState>({})
+  // 活动统计(A61):已关闭会话时长 / 日活跃 / 项目索引
+  const usageByAccount = ref<ActivityUsageAccount[]>([])
+  const usageDaily = ref<ActivityUsageDay[]>([])
+  const projectIndex = ref<ActivityProjectIndex[]>([])
 
   // 计算属性
   const enabledAccounts = computed(() => accounts.value.filter(a => a.enabled))
@@ -590,12 +628,18 @@ export const useAppStore = defineStore('app', () => {
 
   // ===== 账号活动(A55) =====
 
-  // 拉取「账号活动」数据(打开事件聚合 + 最近项目 + 时间线)
-  async function fetchAccountActivity() {
+  // 拉取「账号活动」数据(打开事件聚合 + 最近项目 + 时间线 + 统计)
+  // days: 统计窗口天数,0 = 全部,不传由后端默认 30
+  async function fetchAccountActivity(days?: number) {
     try {
-      const res = await invoke<ActivityPayload>('account_activity_list')
+      const res = await invoke<ActivityPayload>('account_activity_list', {
+        days: days ?? null,
+      })
       activityAccounts.value = res?.accounts || []
       activityEvents.value = res?.events || []
+      usageByAccount.value = res?.usageByAccount || []
+      usageDaily.value = res?.usageDaily || []
+      projectIndex.value = res?.projectIndex || []
       activityGeneratedAt.value = res?.generatedAt ?? null
       return res
     } catch (e) {
@@ -701,6 +745,9 @@ export const useAppStore = defineStore('app', () => {
     activityEvents,
     activityGeneratedAt,
     uiState,
+    usageByAccount,
+    usageDaily,
+    projectIndex,
     // 计算属性
     enabledAccounts,
     todayCheckedCount,

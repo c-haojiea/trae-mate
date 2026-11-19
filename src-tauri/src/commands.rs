@@ -1257,9 +1257,21 @@ fn account_projects(data_dir: Option<&str>) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// 账号活动聚合:最近打开时间 / 近 30 天次数 / 最近项目 + 时间线事件
+/// 项目路径最后一段作为展示名
+fn project_display_name(path: &str) -> String {
+    path.split(['\\', '/'])
+        .filter(|s| !s.is_empty())
+        .last()
+        .unwrap_or(path)
+        .to_string()
+}
+
+/// 账号活动聚合:最近打开时间 / 近 30 天次数 / 最近项目 + 时间线事件 + 使用时长统计
 #[tauri::command]
-pub async fn account_activity_list(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
+pub async fn account_activity_list(
+    days: Option<u32>,
+    state: State<'_, AppState>,
+) -> AppResult<serde_json::Value> {
     // async:要遍历各实例 workspaceStorage 取项目,同步命令会卡住界面
     let accounts = {
         let data = state.data.lock().unwrap();
@@ -1271,6 +1283,13 @@ pub async fn account_activity_list(state: State<'_, AppState>) -> AppResult<serd
     let rc: crate::models::RemainingCreditsFile =
         crate::fs_utils::read_json(&state.data_path("remaining_credits.json"));
     let now = now_ms();
+    // 统计窗口:days 为 0 或未传以外均按天回溯;0 = 全部;默认 30 天
+    let window_days = days.unwrap_or(30);
+    let cutoff = if window_days == 0 {
+        i64::MIN
+    } else {
+        now - (window_days as i64) * 86_400_000
+    };
 
     let mut list: Vec<serde_json::Value> = Vec::new();
     for a in &accounts {
@@ -1329,9 +1348,124 @@ pub async fn account_activity_list(state: State<'_, AppState>) -> AppResult<serd
         })
         .collect();
 
+    // ===== A61:使用时长聚合(仅已关闭会话) =====
+    // 口径:duration = closedAt - at
+    //  - closedAt 为 None(未关闭/旧数据) 不计入时长,但仍计入打开次数
+    //  - duration <= 0 视为无效,忽略
+    //  - duration > 24h 记为 24h,并在该 session 标 suspicious(疑似未正常关闭)
+    const MAX_SESSION_MS: i64 = 24 * 3_600_000;
+    let mut usage_map: std::collections::BTreeMap<String, (i64, Vec<serde_json::Value>)> =
+        std::collections::BTreeMap::new();
+    let mut daily_map: std::collections::BTreeMap<String, (u32, u32, i64)> =
+        std::collections::BTreeMap::new();
+    for e in &activity.events {
+        if e.at < cutoff {
+            continue;
+        }
+        let date = shanghai_date(e.at).format("%Y-%m-%d").to_string();
+        let day = daily_map.entry(date).or_insert((0, 0, 0));
+        day.0 += 1; // openCount:窗口内全部事件
+        let Some(closed) = e.closed_at else { continue };
+        let raw = closed - e.at;
+        if raw <= 0 {
+            continue;
+        }
+        let suspicious = raw > MAX_SESSION_MS;
+        let duration = if suspicious { MAX_SESSION_MS } else { raw };
+        day.1 += 1; // closedCount
+        day.2 += duration;
+        let entry = usage_map
+            .entry(e.account_id.clone())
+            .or_insert_with(|| (0, Vec::new()));
+        entry.0 += duration;
+        entry.1.push(serde_json::json!({
+            "at": e.at,
+            "closedAt": closed,
+            "durationMs": duration,
+            "suspicious": suspicious,
+        }));
+    }
+    let account_name = |id: &str| {
+        accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| id.to_string())
+    };
+    let mut usage_vec: Vec<(String, i64, Vec<serde_json::Value>)> = usage_map
+        .into_iter()
+        .map(|(id, (total, sessions))| (id, total, sessions))
+        .collect();
+    usage_vec.sort_by(|a, b| b.1.cmp(&a.1));
+    let usage_by_account: Vec<serde_json::Value> = usage_vec
+        .into_iter()
+        .map(|(id, total, mut sessions)| {
+            sessions.sort_by_key(|s| s["at"].as_i64().unwrap_or(0));
+            let session_count = sessions.len();
+            serde_json::json!({
+                "accountId": id,
+                "name": account_name(&id),
+                "totalMs": total,
+                "sessionCount": session_count,
+                "sessions": sessions,
+            })
+        })
+        .collect();
+
+    let mut usage_daily: Vec<serde_json::Value> = daily_map
+        .into_iter()
+        .map(|(date, (opens, closed, total))| {
+            serde_json::json!({
+                "date": date,
+                "openCount": opens,
+                "closedCount": closed,
+                "totalMs": total,
+            })
+        })
+        .collect();
+    usage_daily.sort_by(|a, b| a["date"].as_str().cmp(&b["date"].as_str()));
+
+    // ===== A61:项目索引(各账号最近项目合并去重) =====
+    let mut proj_map: std::collections::HashMap<
+        String,
+        (std::collections::BTreeSet<String>, i64),
+    > = std::collections::HashMap::new();
+    for a in &accounts {
+        for p in account_projects(a.data_dir.as_deref()) {
+            let Some(path) = p["path"].as_str() else { continue };
+            let last = p["lastActive"].as_i64().unwrap_or(0);
+            let entry = proj_map.entry(path.to_string()).or_default();
+            entry.0.insert(a.id.clone());
+            if last > entry.1 {
+                entry.1 = last;
+            }
+        }
+    }
+    let mut project_index: Vec<serde_json::Value> = proj_map
+        .into_iter()
+        .map(|(path, (ids, last))| {
+            serde_json::json!({
+                "path": path,
+                "name": project_display_name(&path),
+                "accountIds": ids.into_iter().collect::<Vec<String>>(),
+                "lastActive": last,
+            })
+        })
+        .collect();
+    project_index.sort_by(|a, b| {
+        b["lastActive"]
+            .as_i64()
+            .unwrap_or(0)
+            .cmp(&a["lastActive"].as_i64().unwrap_or(0))
+    });
+    project_index.truncate(100);
+
     Ok(serde_json::json!({
         "accounts": list,
         "events": timeline,
+        "usageByAccount": usage_by_account,
+        "usageDaily": usage_daily,
+        "projectIndex": project_index,
         "generatedAt": crate::fs_utils::now_iso(),
     }))
 }
@@ -1350,7 +1484,7 @@ pub fn ui_state_set(
     state: State<'_, AppState>,
 ) -> AppResult<()> {
     if let Some(v) = view.as_deref() {
-        if !matches!(v, "list" | "card" | "timeline") {
+        if !matches!(v, "list" | "card" | "timeline" | "stats") {
             return Err(AppError::Launch(format!("视图值无效: {v}")));
         }
     }

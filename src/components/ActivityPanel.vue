@@ -29,20 +29,20 @@
       </button>
     </div>
 
-    <!-- 时间线筛选(仅时间线视图) -->
-    <div v-if="view === 'timeline'" class="act-filters">
+    <!-- 时间窗口筛选(时间线 / 统计共用;账号下拉仅时间线) -->
+    <div v-if="view === 'timeline' || view === 'stats'" class="act-filters">
       <div class="act-range">
         <button
-          v-for="r in ranges"
+          v-for="r in dayRanges"
           :key="r.key"
           class="act-range-btn"
-          :class="{ active: timelineRange === r.key }"
-          @click="timelineRange = r.key"
+          :class="{ active: days === r.key }"
+          @click="days = r.key"
         >
           {{ r.label }}
         </button>
       </div>
-      <select v-model="timelineAccount" class="act-select">
+      <select v-if="view === 'timeline'" v-model="timelineAccount" class="act-select">
         <option value="">全部账号</option>
         <option v-for="a in timelineAccountOptions" :key="a.id" :value="a.id">
           {{ a.name }}
@@ -57,8 +57,8 @@
       还没有打开记录，从账号卡片启动一次即可产生
     </div>
 
-    <!-- 空态 -->
-    <div v-if="!loading && filtered.length === 0" class="empty-state">
+    <!-- 空态(统计视图自带空态,不套用账号列表空态) -->
+    <div v-if="!loading && view !== 'stats' && filtered.length === 0" class="empty-state">
       <Icon name="inbox" :size="40" />
       <p>没有匹配的账号</p>
     </div>
@@ -96,7 +96,13 @@
 
     <!-- 卡片视图 -->
     <div v-else-if="view === 'card'" class="act-cards">
-      <div v-for="a in filtered" :key="a.id" class="act-card">
+      <div
+        v-for="a in filtered"
+        :key="a.id"
+        class="act-card"
+        :class="{ 'act-card-highlight': highlightId === a.id }"
+        :data-account-id="a.id"
+      >
         <div class="act-card-top">
           <span class="act-card-name">{{ a.name }}</span>
           <span class="act-tags" @click="openEditor(a)">
@@ -127,6 +133,104 @@
           <span class="act-foot-item" :class="expireClass(a.expiresAt)" title="令牌到期">
             令牌 {{ fmtExpire(a.expiresAt) }}
           </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 统计视图 -->
+    <div v-else-if="view === 'stats'" class="act-stats">
+      <!-- 顶部三张卡 -->
+      <div class="stat-cards">
+        <div class="stat-card">
+          <span class="stat-label">打开次数</span>
+          <b class="stat-value">{{ statTotals.openCount }}</b>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">已关闭会话</span>
+          <b class="stat-value">{{ statTotals.closedCount }}</b>
+        </div>
+        <div class="stat-card">
+          <span class="stat-label">累计使用时长</span>
+          <b class="stat-value">{{ fmtDuration(statTotals.totalMs) }}</b>
+        </div>
+      </div>
+
+      <!-- 每日活跃(最近 7 天) -->
+      <div class="stat-section">
+        <h4>每日活跃（最近 7 天）</h4>
+        <div v-for="d in last7Days" :key="d.date" class="day-row">
+          <span class="day-date">{{ d.date.slice(5) }}</span>
+          <div class="day-bar-wrap">
+            <div class="day-bar opens" :style="{ width: barWidth(d.openCount, maxOpen) }"></div>
+          </div>
+          <span class="day-num">{{ d.openCount }} 次</span>
+          <div class="day-bar-wrap">
+            <div class="day-bar time" :style="{ width: barWidth(d.totalMs, maxMs) }"></div>
+          </div>
+          <span class="day-num">{{ fmtDuration(d.totalMs) }}</span>
+        </div>
+      </div>
+
+      <!-- 按时长排序的账号 -->
+      <div class="stat-section">
+        <h4>按时长排序的账号</h4>
+        <div v-if="store.usageByAccount.length === 0" class="act-empty-hint">
+          选定范围内还没有完整的使用记录（需要先关闭实例）
+        </div>
+        <template v-else>
+          <div
+            v-for="u in visibleUsage"
+            :key="u.accountId"
+            class="usage-row"
+            @click="toggleUsage(u.accountId)"
+          >
+            <span class="usage-name">{{ u.name }}</span>
+            <span class="usage-time">{{ fmtDuration(u.totalMs) }}</span>
+            <span class="usage-count">{{ u.sessionCount }} 次</span>
+            <span class="usage-caret">{{ expandedUsage === u.accountId ? '▾' : '▸' }}</span>
+          </div>
+          <div v-if="expandedUsage" class="session-list">
+            <div v-for="s in expandedSessions" :key="s.at" class="session-row">
+              <span>{{ fmtDateTime(s.at) }}</span>
+              <span class="session-arrow">→ {{ fmtDateTime(s.closedAt) }}</span>
+              <span class="session-dur">{{ fmtDuration(s.durationMs) }}</span>
+              <span v-if="s.suspicious" class="session-warn">可疑（超 24h 按 24h 计）</span>
+            </div>
+          </div>
+          <button
+            v-if="store.usageByAccount.length > 5"
+            class="btn btn-sm btn-outline usage-more"
+            @click="showAllUsage = !showAllUsage"
+          >
+            {{ showAllUsage ? '收起' : `展开全部（${store.usageByAccount.length}）` }}
+          </button>
+        </template>
+      </div>
+
+      <!-- 项目反向查询 -->
+      <div class="stat-section">
+        <h4>项目反向查询</h4>
+        <input
+          v-model="projectQuery"
+          class="act-search"
+          type="text"
+          placeholder="输入项目名，查哪些账号打开过"
+        />
+        <div v-if="projectQuery.trim()" class="proj-results">
+          <div v-if="filteredProjects.length === 0" class="act-empty-hint">没有匹配的项目</div>
+          <div v-for="p in filteredProjects" :key="p.path" class="proj-row">
+            <span class="proj-name" :title="p.path">{{ p.name }}</span>
+            <span class="proj-accounts">
+              <button
+                v-for="id in p.accountIds"
+                :key="id"
+                class="proj-account-link"
+                @click="gotoAccountCard(id)"
+              >
+                {{ accountName(id) }}
+              </button>
+            </span>
+          </div>
         </div>
       </div>
     </div>
@@ -182,7 +286,7 @@ const search = ref('')
 const sortBy = ref<'recent' | 'name' | 'count'>('recent')
 const onlyTagged = ref(false)
 
-const activityViews = ['list', 'card', 'timeline'] as const
+const activityViews = ['list', 'card', 'timeline', 'stats'] as const
 type ActivityView = (typeof activityViews)[number]
 
 // 视图初值:后端 ui_state → localStorage → 列表(双读,兼容旧数据)
@@ -216,16 +320,31 @@ const views = [
   { key: 'list' as const, label: '列表' },
   { key: 'card' as const, label: '卡片' },
   { key: 'timeline' as const, label: '时间线' },
+  { key: 'stats' as const, label: '统计' },
 ]
+
+// 统计窗口:7/30/90 天,0 = 全部;默认近 7 天
+const dayRanges = [
+  { key: 7, label: '近7天' },
+  { key: 30, label: '近30天' },
+  { key: 90, label: '近90天' },
+  { key: 0, label: '全部' },
+] as const
+const days = ref(7)
 
 async function reload() {
   loading.value = true
   try {
-    await store.fetchAccountActivity()
+    await store.fetchAccountActivity(days.value)
   } finally {
     loading.value = false
   }
 }
+
+// 窗口变化即重新拉取(由后端聚合,前端不重算)
+watch(days, () => {
+  void reload()
+})
 
 onMounted(reload)
 // 被 KeepAlive 缓存后,每次切回该页签都要重新拉一次(否则启动实例后仍显示「从未」)
@@ -250,14 +369,7 @@ const filtered = computed(() => {
   return list
 })
 
-// ===== 时间线筛选 =====
-const ranges = [
-  { key: 'today', label: '今天' },
-  { key: '7d', label: '近7天' },
-  { key: '30d', label: '近30天' },
-  { key: 'all', label: '全部' },
-] as const
-const timelineRange = ref<'today' | '7d' | '30d' | 'all'>('today')
+// ===== 时间线筛选(与统计共用同一时间窗口) =====
 const timelineAccount = ref('')
 
 // 账号下拉:仅列出有事件的账号,按最近打开倒序
@@ -268,27 +380,8 @@ const timelineAccountOptions = computed(() =>
     .sort((a, b) => (b.lastOpenedAt || 0) - (a.lastOpenedAt || 0))
 )
 
-// Asia/Shanghai 固定 UTC+8(无夏令时),返回该毫秒时刻所属自然日的 0 点
-function startOfShanghaiDay(ms: number) {
-  const shifted = new Date(ms + 8 * 3_600_000)
-  const dayStartUtc = Date.UTC(
-    shifted.getUTCFullYear(),
-    shifted.getUTCMonth(),
-    shifted.getUTCDate()
-  )
-  return dayStartUtc - 8 * 3_600_000
-}
-
 const filteredTimeline = computed(() => {
-  const now = Date.now()
-  const cutoff =
-    timelineRange.value === 'today'
-      ? startOfShanghaiDay(now)
-      : timelineRange.value === '7d'
-        ? now - 7 * 86_400_000
-        : timelineRange.value === '30d'
-          ? now - 30 * 86_400_000
-          : 0
+  const cutoff = days.value === 0 ? 0 : Date.now() - days.value * 86_400_000
   return store.activityEvents.filter(
     (e) =>
       e.at >= cutoff && (!timelineAccount.value || e.accountId === timelineAccount.value)
@@ -376,6 +469,90 @@ function statusText(a: ActivityAccount) {
   const left = a.expiresAt - Date.now()
   if (left <= 0) return `${base} · 已过期`
   return `${base} · ${(left / 86_400_000).toFixed(1)}d`
+}
+
+// ===== A61:统计视图 =====
+const showAllUsage = ref(false)
+const expandedUsage = ref<string | null>(null)
+const projectQuery = ref('')
+const highlightId = ref<string | null>(null)
+
+// 窗口内合计(后端 usageDaily 已按窗口聚合)
+const statTotals = computed(() => ({
+  openCount: store.usageDaily.reduce((s, d) => s + d.openCount, 0),
+  closedCount: store.usageDaily.reduce((s, d) => s + d.closedCount, 0),
+  totalMs: store.usageDaily.reduce((s, d) => s + d.totalMs, 0),
+}))
+
+// 最近 7 天(无论选定窗口):缺日补 0
+const last7Days = computed(() => {
+  const map = new Map(store.usageDaily.map((d) => [d.date, d]))
+  const out: { date: string; openCount: number; totalMs: number }[] = []
+  for (let i = 6; i >= 0; i--) {
+    const ms = Date.now() - i * 86_400_000
+    const date = new Date(ms).toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' })
+    const d = map.get(date)
+    out.push({ date, openCount: d?.openCount ?? 0, totalMs: d?.totalMs ?? 0 })
+  }
+  return out
+})
+const maxOpen = computed(() => Math.max(1, ...last7Days.value.map((d) => d.openCount)))
+const maxMs = computed(() => Math.max(1, ...last7Days.value.map((d) => d.totalMs)))
+
+function barWidth(v: number, max: number) {
+  return `${Math.round((v / max) * 100)}%`
+}
+
+const visibleUsage = computed(() =>
+  showAllUsage.value ? store.usageByAccount : store.usageByAccount.slice(0, 5)
+)
+const expandedSessions = computed(() => {
+  const id = expandedUsage.value
+  if (!id) return []
+  return store.usageByAccount.find((u) => u.accountId === id)?.sessions ?? []
+})
+function toggleUsage(id: string) {
+  expandedUsage.value = expandedUsage.value === id ? null : id
+}
+
+// 项目反向查询:不区分大小写,匹配 name 或 path
+const filteredProjects = computed(() => {
+  const kw = projectQuery.value.trim().toLowerCase()
+  if (!kw) return []
+  return store.projectIndex.filter(
+    (p) => p.name.toLowerCase().includes(kw) || p.path.toLowerCase().includes(kw)
+  )
+})
+
+function accountName(id: string) {
+  return store.activityAccounts.find((a) => a.id === id)?.name || id
+}
+
+// 项目结果里点账号名:切到卡片视图并高亮/滚动到该卡
+function gotoAccountCard(id: string) {
+  view.value = 'card'
+  highlightId.value = id
+  nextTick(() => {
+    const el = document.querySelector(`[data-account-id="${id}"]`)
+    el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  })
+}
+
+function fmtDateTime(ms: number) {
+  const d = new Date(ms)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+// 时长格式化:<1 分钟 / N 分钟 / N 小时 M 分
+function fmtDuration(ms: number) {
+  if (!ms || ms <= 0) return '0 分钟'
+  if (ms < 60_000) return '<1 分钟'
+  const mins = Math.floor(ms / 60_000)
+  if (mins < 60) return `${mins} 分钟`
+  const h = Math.floor(mins / 60)
+  const m = mins % 60
+  return m ? `${h} 小时 ${m} 分` : `${h} 小时`
 }
 
 // ===== 标签编辑 =====
@@ -791,5 +968,207 @@ async function saveTags() {
   padding: 48px 0;
   color: var(--text-secondary);
   font-size: 13px;
+}
+/* ===== A61:统计视图 ===== */
+.act-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.stat-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.stat-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  background: var(--bg-secondary);
+}
+
+.stat-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.stat-value {
+  font-size: 20px;
+  color: var(--text-primary);
+}
+
+.stat-section {
+  padding: 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+}
+
+.stat-section h4 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.day-row {
+  display: grid;
+  grid-template-columns: 52px 1fr 52px 1fr 86px;
+  gap: 8px;
+  align-items: center;
+  padding: 3px 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.day-date {
+  font-variant-numeric: tabular-nums;
+}
+
+.day-bar-wrap {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg-primary, transparent);
+  overflow: hidden;
+}
+
+.day-bar {
+  height: 100%;
+  border-radius: 999px;
+  min-width: 2px;
+}
+
+.day-bar.opens {
+  background: var(--accent-color, #3b82f6);
+}
+
+.day-bar.time {
+  background: var(--success, #10b981);
+}
+
+.day-num {
+  font-size: 11px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-row {
+  display: grid;
+  grid-template-columns: 1.6fr 1fr 0.6fr 24px;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 6px;
+  border-top: 1px dashed var(--border-color);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.usage-row:hover {
+  background: var(--bg-secondary);
+}
+
+.usage-name {
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-time {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.usage-count {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.usage-caret {
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.session-list {
+  padding: 4px 6px 6px 18px;
+}
+
+.session-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 0.7fr auto;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+  border-top: 1px dotted var(--border-color);
+}
+
+.session-dur {
+  color: var(--text-primary);
+}
+
+.session-warn {
+  color: var(--warning);
+}
+
+.usage-more {
+  margin-top: 8px;
+}
+
+.proj-results {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+}
+
+.proj-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 6px 0;
+  border-top: 1px dashed var(--border-color);
+  font-size: 13px;
+}
+
+.proj-name {
+  min-width: 140px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.proj-accounts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.proj-account-link {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--accent-color, #3b82f6);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.proj-account-link:hover {
+  text-decoration: underline;
+}
+
+.act-card-highlight {
+  border-color: var(--accent-color, #3b82f6) !important;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.35);
+}
+
+.act-stats .act-search {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 4px;
 }
 </style>
