@@ -2,7 +2,7 @@
   <div class="activity-page">
     <!-- 工具条 -->
     <div class="act-toolbar">
-      <input v-model="search" class="act-search" type="text" placeholder="搜索账号名或标签" />
+      <input v-model="search" class="act-search" type="text" placeholder="搜索账号名、标签或备注" />
       <select v-model="sortBy" class="act-select">
         <option value="recent">最近打开</option>
         <option value="name">名称</option>
@@ -77,6 +77,7 @@
       <div class="act-list-head">
         <span class="col-name">账号</span>
         <span class="col-tags">标签</span>
+        <span class="col-note">备注</span>
         <span class="col-status">状态</span>
         <span class="col-time">最近打开</span>
         <span class="col-count">近30天</span>
@@ -90,6 +91,7 @@
           </template>
           <span v-else class="act-tag add">+ 标签</span>
         </span>
+        <span class="col-note" :title="a.note || ''">{{ noteBrief(a.note, 30) }}</span>
         <span class="col-status" :class="{ 'status-off': !a.enabled }">{{ statusText(a) }}</span>
         <span class="col-time">{{ fmtRel(a.lastOpenedAt) }}</span>
         <span class="col-count">{{ a.openCount30d }}</span>
@@ -121,6 +123,8 @@
             <span v-else class="act-tag add">+ 标签</span>
           </span>
         </div>
+        <!-- A63:账号备注摘要(最多 2 行) -->
+        <div v-if="a.note" class="act-card-note" :title="a.note">{{ a.note }}</div>
         <div class="act-card-body">
           <div class="act-kv"><span>最近打开</span><b>{{ fmtRel(a.lastOpenedAt) }}</b></div>
           <div class="act-kv"><span>近 30 天</span><b>{{ a.openCount30d }} 次</b></div>
@@ -249,33 +253,73 @@
       <div v-if="filteredTimeline.length === 0" class="act-empty-hint">该范围内没有打开记录</div>
       <template v-for="g in timelineGroups" :key="g.date">
         <div class="act-day">{{ g.label }}</div>
-        <div v-for="(e, i) in g.items" :key="g.date + '-' + i" class="act-event">
-          <span class="act-event-time">{{ fmtTime(e.at) }}</span>
-          <span class="act-event-name">{{ e.name }}</span>
-          <span class="act-tags">
-            <span v-for="t in e.tags" :key="t" class="act-tag">{{ t }}</span>
-          </span>
-          <span class="act-event-entry">{{ entryLabel(e.entry) }}</span>
+        <div v-for="(e, i) in g.items" :key="g.date + '-' + i" class="act-event-wrap">
+          <div class="act-event">
+            <span class="act-event-time">{{ fmtTime(e.at) }}</span>
+            <span class="act-event-name">{{ e.name }}</span>
+            <span class="act-tags">
+              <span v-for="t in e.tags" :key="t" class="act-tag">{{ t }}</span>
+            </span>
+            <span class="act-event-entry">
+              <span>{{ entryLabel(e.entry) }}</span>
+              <button class="act-note-btn" @click="openEventNote(e)">
+                {{ e.note ? '改备注' : '＋ 备注' }}
+              </button>
+            </span>
+          </div>
+          <!-- A63:该次打开的一句话记录 -->
+          <div v-if="e.note" class="act-event-note" :title="e.note" @click="openEventNote(e)">
+            {{ e.note }}
+          </div>
         </div>
       </template>
     </div>
 
-    <!-- 标签编辑弹窗 -->
+    <!-- 标签编辑弹窗(A63:胶囊输入) -->
     <div v-if="editing" class="act-mask" @click.self="closeEditor">
       <div class="act-editor">
         <h3>{{ editing.name }} · 标签</h3>
-        <p class="act-editor-hint">用逗号或回车分隔，最多 8 个，单个不超过 24 字</p>
-        <input
-          ref="editorInput"
-          v-model="editorText"
-          class="act-search"
-          type="text"
-          placeholder="例如：Anki分析, 视频下载器"
-          @keydown.enter.prevent="saveTags"
-        />
+        <p class="act-editor-hint">回车或逗号添加，最多 8 个，单个不超过 24 字</p>
+        <div class="tag-input-box">
+          <span v-for="(t, i) in draftTags" :key="t + i" class="act-tag">
+            {{ t }}
+            <button type="button" class="tag-x" title="移除" @click.stop="removeDraftTag(i)">×</button>
+          </span>
+          <input
+            ref="editorInput"
+            v-model="tagInputText"
+            class="tag-input"
+            type="text"
+            :disabled="draftTags.length >= TAG_MAX"
+            :placeholder="draftTags.length >= TAG_MAX ? '已达上限 8 个' : '输入后回车/逗号添加'"
+            @keydown="onTagKeydown"
+          />
+        </div>
         <div class="act-editor-actions">
           <button class="btn btn-sm btn-outline" @click="closeEditor">取消</button>
           <button class="btn btn-sm btn-primary" :disabled="saving" @click="saveTags">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- A63:事件备注编辑弹窗 -->
+    <div v-if="eventNoteEditing" class="act-mask" @click.self="closeEventNote">
+      <div class="act-editor">
+        <h3>{{ eventNoteEditing.name }} · {{ fmtDateTime(eventNoteEditing.at) }} 备注</h3>
+        <p class="act-editor-hint">回车保存，最多 500 字；留空保存即清除</p>
+        <input
+          ref="eventNoteInput"
+          v-model="eventNoteText"
+          class="act-search"
+          type="text"
+          maxlength="500"
+          placeholder="例如：今天做 Anki 整理"
+          @keydown.enter.prevent="saveEventNote"
+          @keydown.esc="closeEventNote"
+        />
+        <div class="act-editor-actions">
+          <button class="btn btn-sm btn-outline" @click="closeEventNote">取消</button>
+          <button class="btn btn-sm btn-primary" :disabled="eventNoteSaving" @click="saveEventNote">保存</button>
         </div>
       </div>
     </div>
@@ -284,7 +328,12 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onActivated, onMounted, ref, watch } from 'vue'
-import { ACTIVITY_VIEW_KEY, useAppStore, type ActivityAccount } from '../stores/app'
+import {
+  ACTIVITY_VIEW_KEY,
+  useAppStore,
+  type ActivityAccount,
+  type ActivityTimelineEvent,
+} from '../stores/app'
 import Icon from './Icon.vue'
 
 const emit = defineEmits(['notify'])
@@ -365,7 +414,11 @@ const filtered = computed(() => {
   let list = store.activityAccounts.filter((a) => {
     if (onlyTagged.value && a.tags.length === 0) return false
     if (!kw) return true
-    return a.name.toLowerCase().includes(kw) || a.tags.some((t) => t.toLowerCase().includes(kw))
+    return (
+      a.name.toLowerCase().includes(kw) ||
+      a.tags.some((t) => t.toLowerCase().includes(kw)) ||
+      (a.note || '').toLowerCase().includes(kw)
+    )
   })
   list = [...list]
   if (sortBy.value === 'name') {
@@ -581,15 +634,19 @@ function fmtDuration(ms: number) {
   return m ? `${h} 小时 ${m} 分` : `${h} 小时`
 }
 
-// ===== 标签编辑 =====
+// ===== A63:标签编辑(胶囊输入) =====
+const TAG_MAX = 8
+const TAG_MAX_LEN = 24
 const editing = ref<ActivityAccount | null>(null)
-const editorText = ref('')
+const draftTags = ref<string[]>([])
+const tagInputText = ref('')
 const saving = ref(false)
 const editorInput = ref<HTMLInputElement | null>(null)
 
 function openEditor(a: ActivityAccount) {
   editing.value = { ...a }
-  editorText.value = a.tags.join(', ')
+  draftTags.value = [...(a.tags || [])]
+  tagInputText.value = ''
   nextTick(() => editorInput.value?.focus())
 }
 
@@ -597,21 +654,90 @@ function closeEditor() {
   editing.value = null
 }
 
+function removeDraftTag(i: number) {
+  draftTags.value.splice(i, 1)
+}
+
+// 回车/逗号 → 追加胶囊;输入框为空时 Backspace → 删除最后一个
+function onTagKeydown(e: KeyboardEvent) {
+  if (e.isComposing) return
+  if (e.key === 'Enter' || e.key === ',' || e.key === '，') {
+    e.preventDefault()
+    commitTagInput()
+    return
+  }
+  if (e.key === 'Backspace' && tagInputText.value === '' && draftTags.value.length) {
+    e.preventDefault()
+    draftTags.value.pop()
+  }
+}
+
+function commitTagInput() {
+  const raw = tagInputText.value.trim()
+  tagInputText.value = ''
+  if (!raw) return
+  for (const part of raw.split(/[,，]/).map((s) => s.trim()).filter(Boolean)) {
+    if (draftTags.value.length >= TAG_MAX) {
+      emit('notify', `已达上限 ${TAG_MAX} 个`, 'error')
+      break
+    }
+    let t = part
+    if (t.length > TAG_MAX_LEN) {
+      t = t.slice(0, TAG_MAX_LEN)
+      emit('notify', `标签超过 ${TAG_MAX_LEN} 字，已截断`, 'error')
+    }
+    if (!draftTags.value.includes(t)) draftTags.value.push(t)
+  }
+}
+
 async function saveTags() {
   if (!editing.value || saving.value) return
-  const tags = editorText.value
-    .split(/[,，\n]/)
-    .map((s) => s.trim())
-    .filter(Boolean)
+  commitTagInput()
   saving.value = true
   try {
-    await store.updateAccountTags(editing.value.id, tags)
+    await store.updateAccountTags(editing.value.id, [...draftTags.value])
     emit('notify', '标签已保存', 'success')
     editing.value = null
   } catch (e: any) {
     emit('notify', String(e?.message || e || '保存标签失败'), 'error')
   } finally {
     saving.value = false
+  }
+}
+
+// ===== A63:备注摘要 / 事件备注 =====
+function noteBrief(note: string | null | undefined, max: number) {
+  const n = note || ''
+  return n.length > max ? n.slice(0, max) + '…' : n || '—'
+}
+
+const eventNoteEditing = ref<ActivityTimelineEvent | null>(null)
+const eventNoteText = ref('')
+const eventNoteSaving = ref(false)
+const eventNoteInput = ref<HTMLInputElement | null>(null)
+
+function openEventNote(e: ActivityTimelineEvent) {
+  eventNoteEditing.value = e
+  eventNoteText.value = e.note || ''
+  nextTick(() => eventNoteInput.value?.focus())
+}
+
+function closeEventNote() {
+  eventNoteEditing.value = null
+}
+
+async function saveEventNote() {
+  if (!eventNoteEditing.value || eventNoteSaving.value) return
+  const e = eventNoteEditing.value
+  eventNoteSaving.value = true
+  try {
+    await store.setActivityNote(e.accountId, e.at, eventNoteText.value.trim() || null)
+    emit('notify', '备注已保存', 'success')
+    eventNoteEditing.value = null
+  } catch (err: any) {
+    emit('notify', String(err?.message || err || '保存备注失败'), 'error')
+  } finally {
+    eventNoteSaving.value = false
   }
 }
 </script>
@@ -734,7 +860,7 @@ async function saveTags() {
 .act-list-head,
 .act-row {
   display: grid;
-  grid-template-columns: 1.2fr 1.5fr 1fr 0.85fr 0.55fr 1.2fr;
+  grid-template-columns: 1.1fr 1.4fr 1.3fr 0.9fr 0.8fr 0.5fr 1.1fr;
   gap: 10px;
   align-items: center;
   padding: 9px 12px;
@@ -782,12 +908,21 @@ async function saveTags() {
 @media (max-width: 680px) {
   .act-list-head,
   .act-row {
-    grid-template-columns: 1.2fr 1.4fr 0.9fr 0.55fr 1.2fr;
+    grid-template-columns: 1.1fr 1.3fr 1.2fr 0.75fr 0.5fr 1fr;
   }
 
   .col-status {
     display: none;
   }
+}
+
+/* A63:备注列(截断,全文走 title) */
+.col-note {
+  color: var(--text-secondary);
+  font-style: italic;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .col-proj {
@@ -922,11 +1057,14 @@ async function saveTags() {
 
 .act-event {
   display: grid;
-  grid-template-columns: 70px 1.4fr 1.6fr 70px;
+  grid-template-columns: 70px 1.4fr 1.6fr 110px;
   gap: 10px;
   align-items: center;
   padding: 6px 0;
   font-size: 13px;
+}
+
+.act-event-wrap {
   border-top: 1px dashed var(--border-color);
 }
 
@@ -943,9 +1081,102 @@ async function saveTags() {
 }
 
 .act-event-entry {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
   text-align: right;
   font-size: 11px;
   color: var(--text-secondary);
+}
+
+/* A63:时间线事件备注 */
+.act-note-btn {
+  border: 1px dashed var(--border-color);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 10px;
+  padding: 1px 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.act-note-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.act-event-note {
+  padding: 0 0 6px 80px;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-secondary);
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A63:卡片视图备注摘要(2 行省略) */
+.act-card-note {
+  margin: 4px 0 6px;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-secondary);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* A63:标签胶囊输入 */
+.tag-input-box {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 38px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-primary, transparent);
+  box-sizing: border-box;
+}
+
+.tag-input-box .act-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+}
+
+.tag-x {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+}
+
+.tag-x:hover {
+  color: var(--danger);
+}
+
+.tag-input {
+  flex: 1;
+  min-width: 120px;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.tag-input::placeholder {
+  color: var(--text-muted);
 }
 
 .act-mask {

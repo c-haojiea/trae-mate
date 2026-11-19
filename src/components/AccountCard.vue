@@ -20,6 +20,11 @@
             </template>
             <span v-else class="tag-chip add">+ 标签</span>
           </div>
+          <!-- A63:账号备注(有则显示前 40 字,无则弱化入口) -->
+          <div class="note-row" @click.stop="openNoteEditor">
+            <span v-if="account.note" class="note-text" :title="account.note">{{ notePreview }}</span>
+            <span v-else class="note-add">＋ 备注</span>
+          </div>
         </div>
       </div>
       <div class="switch" :class="{ active: account.enabled }" @click="handleToggle">
@@ -138,18 +143,43 @@
   <div v-if="tagEditing" class="act-mask" @click.self="closeTagEditor">
     <div class="act-editor">
       <h3>{{ account.name }} · 标签</h3>
-      <p class="act-editor-hint">用逗号或回车分隔，最多 8 个，单个不超过 24 字</p>
-      <input
-        ref="tagInput"
-        v-model="tagText"
-        class="input"
-        type="text"
-        placeholder="例如：Anki分析, 视频下载器"
-        @keydown.enter.prevent="saveTags"
-      />
+      <p class="act-editor-hint">回车或逗号添加，最多 8 个，单个不超过 24 字</p>
+      <div class="tag-input-box">
+        <span v-for="(t, i) in draftTags" :key="t + i" class="tag-chip">
+          {{ t }}
+          <button type="button" class="tag-x" title="移除" @click.stop="removeDraftTag(i)">×</button>
+        </span>
+        <input
+          ref="tagInput"
+          v-model="tagInputText"
+          class="tag-input"
+          type="text"
+          :disabled="draftTags.length >= TAG_MAX"
+          :placeholder="draftTags.length >= TAG_MAX ? '已达上限 8 个' : '输入后回车/逗号添加'"
+          @keydown="onTagKeydown"
+        />
+      </div>
       <div class="act-editor-actions">
         <button class="btn btn-sm btn-outline" @click="closeTagEditor">取消</button>
         <button class="btn btn-sm btn-primary" :disabled="tagSaving" @click="saveTags">保存</button>
+      </div>
+    </div>
+  </div>
+  <!-- A63:账号备注编辑弹窗 -->
+  <div v-if="noteEditing" class="act-mask" @click.self="closeNoteEditor">
+    <div class="act-editor">
+      <h3>{{ account.name }} · 备注</h3>
+      <textarea
+        v-model="noteText"
+        class="note-textarea"
+        rows="5"
+        maxlength="2000"
+        placeholder="写下对这个账号的印象、用途或注意事项…"
+      ></textarea>
+      <p class="act-editor-hint note-count">还可输入 {{ 2000 - noteText.length }} 字</p>
+      <div class="act-editor-actions">
+        <button class="btn btn-sm btn-outline" @click="closeNoteEditor">取消</button>
+        <button class="btn btn-sm btn-primary" :disabled="noteSaving" @click="saveNote">保存</button>
       </div>
     </div>
   </div>
@@ -376,15 +406,20 @@ function startEdit() { tagEditing.value = false; draftName.value = props.account
 function cancelEdit() { editing.value = false }
 function saveEdit() { const name = draftName.value.trim(); if (name && name !== props.account.name) emit('edit', props.account.id, name); editing.value = false }
 
-// ===== A59:标签编辑(与账号活动页同一交互) =====
+// ===== A59/A63:标签编辑(胶囊输入,与账号活动页同一交互) =====
+const TAG_MAX = 8
+const TAG_MAX_LEN = 24
 const tagEditing = ref(false)
-const tagText = ref('')
+const draftTags = ref<string[]>([])
+const tagInputText = ref('')
 const tagSaving = ref(false)
 const tagInput = ref<HTMLInputElement | null>(null)
 
 function openTagEditor() {
   editing.value = false
-  tagText.value = (props.account.tags || []).join(', ')
+  noteEditing.value = false
+  draftTags.value = [...(props.account.tags || [])]
+  tagInputText.value = ''
   tagEditing.value = true
   nextTick(() => tagInput.value?.focus())
 }
@@ -393,21 +428,89 @@ function closeTagEditor() {
   tagEditing.value = false
 }
 
+function removeDraftTag(i: number) {
+  draftTags.value.splice(i, 1)
+}
+
+// 回车/逗号 → 追加胶囊;输入框为空时 Backspace → 删除最后一个
+function onTagKeydown(e: KeyboardEvent) {
+  if (e.isComposing) return
+  if (e.key === 'Enter' || e.key === ',' || e.key === '，') {
+    e.preventDefault()
+    commitTagInput()
+    return
+  }
+  if (e.key === 'Backspace' && tagInputText.value === '' && draftTags.value.length) {
+    e.preventDefault()
+    draftTags.value.pop()
+  }
+}
+
+function commitTagInput() {
+  const raw = tagInputText.value.trim()
+  tagInputText.value = ''
+  if (!raw) return
+  for (const part of raw.split(/[,，]/).map((s) => s.trim()).filter(Boolean)) {
+    if (draftTags.value.length >= TAG_MAX) {
+      emit('notify', `已达上限 ${TAG_MAX} 个`, 'error')
+      break
+    }
+    let t = part
+    if (t.length > TAG_MAX_LEN) {
+      t = t.slice(0, TAG_MAX_LEN)
+      emit('notify', `标签超过 ${TAG_MAX_LEN} 字，已截断`, 'error')
+    }
+    if (!draftTags.value.includes(t)) draftTags.value.push(t)
+  }
+}
+
 async function saveTags() {
   if (tagSaving.value) return
-  const tags = tagText.value
-    .split(/[,，\n]/)
-    .map((s) => s.trim())
-    .filter(Boolean)
+  commitTagInput()
   tagSaving.value = true
   try {
-    await store.updateAccountTags(props.account.id, tags)
+    await store.updateAccountTags(props.account.id, [...draftTags.value])
     emit('notify', '标签已保存', 'success')
     tagEditing.value = false
   } catch (e: any) {
     emit('notify', String(e?.message || e || '保存标签失败'), 'error')
   } finally {
     tagSaving.value = false
+  }
+}
+
+// ===== A63:账号备注 =====
+const noteEditing = ref(false)
+const noteText = ref('')
+const noteSaving = ref(false)
+
+const notePreview = computed(() => {
+  const n = props.account.note || ''
+  return n.length > 40 ? n.slice(0, 40) + '…' : n
+})
+
+function openNoteEditor() {
+  editing.value = false
+  tagEditing.value = false
+  noteText.value = props.account.note || ''
+  noteEditing.value = true
+}
+
+function closeNoteEditor() {
+  noteEditing.value = false
+}
+
+async function saveNote() {
+  if (noteSaving.value) return
+  noteSaving.value = true
+  try {
+    await store.updateAccountNote(props.account.id, noteText.value.trim() || null)
+    emit('notify', '备注已保存', 'success')
+    noteEditing.value = false
+  } catch (e: any) {
+    emit('notify', String(e?.message || e || '保存备注失败'), 'error')
+  } finally {
+    noteSaving.value = false
   }
 }
 
@@ -799,6 +902,106 @@ function formatDateTime(timestamp: number): string {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 12px;
+}
+
+/* A63:账号备注(卡片内摘要 / 弱化入口) */
+.note-row {
+  min-height: 16px;
+  cursor: pointer;
+}
+
+.note-text {
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-style: italic;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: block;
+  max-width: 220px;
+}
+
+.note-add {
+  font-size: 11px;
+  color: var(--text-muted);
+  opacity: 0.75;
+}
+
+.note-row:hover .note-add {
+  opacity: 1;
+  color: var(--accent);
+}
+
+/* A63:标签胶囊输入框 */
+.tag-input-box {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 38px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--surface, transparent);
+  box-sizing: border-box;
+}
+
+.tag-input-box .tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.tag-x {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+}
+
+.tag-x:hover {
+  color: var(--danger);
+}
+
+.tag-input {
+  flex: 1;
+  min-width: 120px;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.tag-input:disabled {
+  cursor: not-allowed;
+}
+
+.tag-input::placeholder {
+  color: var(--text-muted);
+}
+
+/* A63:备注输入 */
+.note-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--surface, transparent);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 13px;
+  resize: vertical;
+}
+
+.note-count {
+  margin: 6px 0 0;
+  text-align: right;
 }
 
 @keyframes spin {

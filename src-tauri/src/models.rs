@@ -85,6 +85,9 @@ pub struct Account {
     /// 用途/项目标签(手动维护,如「Anki分析」「视频下载器」)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// 账号备注/个人感受,最长 2000 字
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// 账号(脱敏,返回前端)。不含加密凭据。
@@ -122,6 +125,8 @@ pub struct PublicAccount {
     pub cooldown_reason: Option<String>,
     pub checked_today: Option<bool>,
     pub tags: Vec<String>,
+    /// 账号备注(最长 2000 字,无备注为 None)
+    pub note: Option<String>,
 }
 
 impl From<Account> for PublicAccount {
@@ -157,6 +162,7 @@ impl From<Account> for PublicAccount {
             cooldown_reason: a.cooldown_reason,
             checked_today: a.checked_today,
             tags: a.tags,
+            note: a.note,
         }
     }
 }
@@ -178,6 +184,9 @@ pub struct ActivityEvent {
     /// 打开瞬间的账号标签快照;旧事件为空数组
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags_snapshot: Vec<String>,
+    /// 该次打开的一句话记录(用户手写,最长 500 字)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// 账号打开事件文件

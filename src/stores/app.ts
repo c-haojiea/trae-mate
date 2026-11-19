@@ -38,6 +38,8 @@ export interface Account {
   checkedToday?: boolean
   /** 用途/项目标签(手动维护) */
   tags?: string[]
+  /** 账号备注(最长 2000 字) */
+  note?: string | null
 }
 
 export interface CheckinLog {
@@ -145,6 +147,8 @@ export interface ActivityAccount {
   name: string
   enabled: boolean
   tags: string[]
+  /** 账号备注(无备注为 null) */
+  note?: string | null
   lastOpenedAt: number | null
   openCount30d: number
   projects: ActivityProject[]
@@ -163,6 +167,8 @@ export interface ActivityTimelineEvent {
   tags: string[]
   at: number
   entry: string
+  /** 该次打开的一句话记录(无则 null) */
+  note?: string | null
 }
 
 export interface ActivityPayload {
@@ -666,8 +672,25 @@ export const useAppStore = defineStore('app', () => {
     return acc
   }
 
-  // ===== UI 偏好(视图/主题后端持久化) =====
+  // 更新账号备注(最长 2000 字;空串 = 清除)
+  async function updateAccountNote(id: string, note: string | null) {
+    const acc = await invoke<Account>('update_account_note', { id, note })
+    const idx = accounts.value.findIndex((a) => a.id === id)
+    if (idx >= 0) accounts.value[idx] = { ...accounts.value[idx], ...acc }
+    const aidx = activityAccounts.value.findIndex((a) => a.id === id)
+    if (aidx >= 0) activityAccounts.value[aidx] = { ...activityAccounts.value[aidx], note: acc.note ?? null }
+    return acc
+  }
 
+  // 给时间线某条打开事件写备注(最长 500 字;空串 = 清除)
+  async function setActivityNote(accountId: string, at: number, note: string | null) {
+    await invoke('set_activity_note', { accountId, at, note })
+    activityEvents.value = activityEvents.value.map((e) =>
+      e.accountId === accountId && e.at === at ? { ...e, note: note ?? null } : e
+    )
+  }
+
+  // ===== UI 偏好(视图/主题后端持久化) =====
   async function fetchUiState() {
     try {
       const res = await invoke<UiState>('ui_state_get')
@@ -784,6 +807,8 @@ export const useAppStore = defineStore('app', () => {
     fetchAccountActivity,
     exportActivityCsv,
     updateAccountTags,
+    updateAccountNote,
+    setActivityNote,
     fetchUiState,
     saveUiState,
     getTraeExePath,

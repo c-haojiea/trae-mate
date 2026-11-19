@@ -1082,6 +1082,23 @@ fn normalize_tags(tags: &[String]) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// 备注规范化:trim 后为空串视为清除(None);超过 max 字符返回中文错误
+fn normalize_note(
+    note: Option<String>,
+    max: usize,
+    too_long: &str,
+) -> Result<Option<String>, String> {
+    let Some(raw) = note else { return Ok(None) };
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    if t.chars().count() > max {
+        return Err(too_long.to_string());
+    }
+    Ok(Some(t.to_string()))
+}
+
 /// 事件裁剪:只保留最近 5000 条
 fn trim_events(mut events: Vec<crate::models::ActivityEvent>) -> Vec<crate::models::ActivityEvent> {
     if events.len() > ACTIVITY_MAX_EVENTS {
@@ -1118,6 +1135,7 @@ fn append_activity(
         entry: entry.to_string(),
         closed_at: None,
         tags_snapshot,
+        note: None,
     });
     file.events = trim_events(file.events);
     if let Err(e) = crate::fs_utils::write_json(&path, &file) {
@@ -1372,6 +1390,7 @@ pub async fn account_activity_list(
             "name": a.name,
             "enabled": a.enabled,
             "tags": a.tags,
+            "note": a.note,
             "lastOpenedAt": last_opened,
             "openCount30d": count_opens_30d(&activity.events, &a.id, now),
             "projects": account_projects(a.data_dir.as_deref()),
@@ -1411,6 +1430,7 @@ pub async fn account_activity_list(
                 "at": e.at,
                 "entry": e.entry,
                 "closedAt": e.closed_at,
+                "note": e.note,
             })
         })
         .collect();
@@ -1560,7 +1580,7 @@ pub fn export_activity_csv(
         activity.events.iter().filter(|e| e.at >= cutoff).collect();
     rows.sort_by_key(|e| e.at);
     let mut events_csv = String::from(
-        "\u{feff}date,time,accountId,accountName,entry,openedAt,closedAt,durationMin,suspicious,tags\n",
+        "\u{feff}date,time,accountId,accountName,entry,openedAt,closedAt,durationMin,suspicious,tags,note\n",
     );
     for e in &rows {
         let (closed_at, duration_min, suspicious) = match e.closed_at {
@@ -1577,7 +1597,7 @@ pub fn export_activity_csv(
             _ => (String::new(), "0.00".to_string(), "false".to_string()),
         };
         events_csv.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{}\n",
             shanghai_date(e.at).format("%Y-%m-%d"),
             shanghai_local(e.at, false),
             csv_escape_field(&e.account_id),
@@ -1588,6 +1608,7 @@ pub fn export_activity_csv(
             duration_min,
             suspicious,
             csv_escape_field(&e.tags_snapshot.join(";")),
+            csv_escape_field(e.note.as_deref().unwrap_or("")),
         ));
     }
 
@@ -1698,6 +1719,55 @@ pub fn update_account_tags(
         .ok_or_else(|| AppError::NotFound(id.clone()))?;
     data.save(&state.path)?;
     Ok(acc.into())
+}
+
+/// 更新账号备注(最长 2000 字;trim 后为空视为清除)
+#[tauri::command]
+pub fn update_account_note(
+    id: String,
+    note: Option<String>,
+    state: State<'_, AppState>,
+) -> AppResult<PublicAccount> {
+    let clean = normalize_note(note, 2000, "备注最多 2000 字").map_err(AppError::Launch)?;
+    let mut data = state.data.lock().unwrap();
+    let acc = data
+        .update_account(&id, serde_json::json!({ "note": clean }))
+        .ok_or_else(|| AppError::NotFound(id.clone()))?;
+    data.save(&state.path)?;
+    Ok(acc.into())
+}
+
+/// 给某条打开事件写备注:按 (accountId, at) 精确定位,原子写回
+fn set_activity_note_inner(
+    state: &AppState,
+    account_id: &str,
+    at: i64,
+    note: Option<String>,
+) -> AppResult<()> {
+    let clean = normalize_note(note, 500, "单条备注最多 500 字").map_err(AppError::Launch)?;
+    let path = state.data_path("account_activity.json");
+    let _guard = state.activity_lock.lock().unwrap();
+    let mut file: crate::models::AccountActivityFile = crate::fs_utils::read_json(&path);
+    match file
+        .events
+        .iter_mut()
+        .find(|e| e.account_id == account_id && e.at == at)
+    {
+        Some(e) => e.note = clean,
+        None => return Err(AppError::Launch("未找到该条打开记录".into())),
+    }
+    crate::fs_utils::write_json(&path, &file).map_err(AppError::Launch)
+}
+
+/// 给时间线某条事件写备注(最长 500 字;trim 后为空视为清除)
+#[tauri::command]
+pub fn set_activity_note(
+    account_id: String,
+    at: i64,
+    note: Option<String>,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    set_activity_note_inner(&state, &account_id, at, note)
 }
 
 /// 聚焦账号实例窗口:工具实例运行聚焦其 data-dir 窗口,主实例运行聚焦主目录窗口,未运行则报错。
@@ -2931,6 +3001,67 @@ mod tests {
         assert!(acc.tags.is_empty(), "缺失 tags 必须回退为空数组");
     }
 
+    /// A63:账号备注超过 2000 字被拒绝;trim 后为空视为清除
+    #[test]
+    fn account_note_rejects_over_2000_chars() {
+        let ok = "字".repeat(2000);
+        assert_eq!(
+            normalize_note(Some(ok.clone()), 2000, "备注最多 2000 字").unwrap(),
+            Some(ok),
+            "2000 字应通过并原样保存"
+        );
+        let err = normalize_note(Some("字".repeat(2001)), 2000, "备注最多 2000 字").unwrap_err();
+        assert_eq!(err, "备注最多 2000 字");
+        assert_eq!(
+            normalize_note(Some("   \n ".to_string()), 2000, "备注最多 2000 字").unwrap(),
+            None,
+            "trim 后为空视为清除"
+        );
+    }
+
+    /// A63:旧账号 JSON 无 note 字段时默认 None
+    #[test]
+    fn account_without_note_deserializes_to_none() {
+        let legacy = r#"{"id":"a1","name":"老号","cookie":"","createdAt":1,"enabled":true}"#;
+        let acc: Account = serde_json::from_str(legacy).unwrap();
+        assert!(acc.note.is_none(), "缺失 note 必须默认 None");
+    }
+
+    /// A63:事件备注按 (accountId, at) 精确定位,只改目标一条
+    #[test]
+    fn activity_note_only_updates_matching_event() {
+        let (state, root) = activity_state("activity_note");
+        let ev = |at: i64| crate::models::ActivityEvent {
+            account_id: "a1".to_string(),
+            desktop_user_id: None,
+            at,
+            entry: "card".to_string(),
+            closed_at: None,
+            tags_snapshot: Vec::new(),
+            note: None,
+        };
+        let path = state.data_path("account_activity.json");
+        crate::fs_utils::write_json(
+            &path,
+            &crate::models::AccountActivityFile {
+                events: vec![ev(100), ev(200)],
+            },
+        )
+        .unwrap();
+
+        set_activity_note_inner(&state, "a1", 200, Some("今天做 Anki 整理".into())).unwrap();
+
+        let got: crate::models::AccountActivityFile = crate::fs_utils::read_json(&path);
+        assert_eq!(got.events.len(), 2);
+        assert!(got.events[0].note.is_none(), "非目标事件不得改动");
+        assert_eq!(got.events[1].note.as_deref(), Some("今天做 Anki 整理"));
+        assert!(
+            set_activity_note_inner(&state, "a1", 999, Some("x".into())).is_err(),
+            "找不到该条记录必须报错"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A55:近 30 天次数按 Asia/Shanghai 自然日窗口统计(含今天,排除 30 天前)
     #[test]
     fn open_count_uses_30_day_window() {
@@ -2943,6 +3074,7 @@ mod tests {
             entry: "card".to_string(),
             closed_at: None,
             tags_snapshot: Vec::new(),
+            note: None,
         };
         let events = vec![
             ev(now),
@@ -2966,6 +3098,7 @@ mod tests {
                 entry: "card".to_string(),
                 closed_at: None,
                 tags_snapshot: Vec::new(),
+                note: None,
             })
             .collect();
 
@@ -3059,6 +3192,7 @@ mod tests {
             entry: "card".to_string(),
             closed_at: None,
             tags_snapshot: Vec::new(),
+            note: None,
         };
         let path = state.data_path("account_activity.json");
         crate::fs_utils::write_json(
@@ -3093,6 +3227,7 @@ mod tests {
                     entry: "card".to_string(),
                     closed_at: Some(150),
                     tags_snapshot: Vec::new(),
+                    note: None,
                 }],
             },
         )

@@ -280,6 +280,8 @@ pub fn run() {
             commands::get_all_instance_states,
             commands::account_activity_list,
             commands::update_account_tags,
+            commands::update_account_note,
+            commands::set_activity_note,
             commands::focus_account_instance,
             commands::open_new_login_instance,
             commands::scan_instance_dirs,
