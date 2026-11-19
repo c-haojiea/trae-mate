@@ -628,6 +628,11 @@ export const useAppStore = defineStore('app', () => {
 
   // ===== 账号活动(A55) =====
 
+  // 导出账号活动 CSV(流水 + 按账号汇总),返回两个文件的绝对路径
+  async function exportActivityCsv(days?: number): Promise<string[]> {
+    return await invoke<string[]>('export_activity_csv', { days: days ?? null })
+  }
+
   // 拉取「账号活动」数据(打开事件聚合 + 最近项目 + 时间线 + 统计)
   // days: 统计窗口天数,0 = 全部,不传由后端默认 30
   async function fetchAccountActivity(days?: number) {
@@ -777,6 +782,7 @@ export const useAppStore = defineStore('app', () => {
     focusInstance,
     refreshInstances,
     fetchAccountActivity,
+    exportActivityCsv,
     updateAccountTags,
     fetchUiState,
     saveUiState,

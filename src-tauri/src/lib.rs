@@ -300,6 +300,8 @@ pub fn run() {
             // UI 偏好持久化(视图/主题记忆)
             commands::ui_state_get,
             commands::ui_state_set,
+            // 账号活动 CSV 导出
+            commands::export_activity_csv,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

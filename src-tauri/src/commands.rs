@@ -1162,6 +1162,73 @@ fn shanghai_date(ms: i64) -> chrono::NaiveDate {
         .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
 }
 
+/// 毫秒时间戳 → Asia/Shanghai 本地时间(YYYY-MM-DD HH:mm:ss / 仅时间)
+fn shanghai_local(ms: i64, with_date: bool) -> String {
+    use chrono::TimeZone;
+    let dt = chrono::Utc
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|d| d.with_timezone(&chrono_tz::Asia::Shanghai));
+    match dt {
+        Some(d) if with_date => d.format("%Y-%m-%d %H:%M:%S").to_string(),
+        Some(d) => d.format("%H:%M:%S").to_string(),
+        None => String::new(),
+    }
+}
+
+/// 会话时长上限:超过 24h 视为异常(可能未正常关闭),按 24h 计
+const MAX_SESSION_MS: i64 = 24 * 3_600_000;
+
+type UsageMap = std::collections::BTreeMap<String, (i64, Vec<serde_json::Value>)>;
+type DailyMap = std::collections::BTreeMap<String, (u32, u32, i64)>;
+
+/// 活动时长聚合(界面统计与 CSV 导出共用同一套公式):
+/// duration = closedAt - at;closedAt 缺失或 <=0 忽略;>24h 截断并标 suspicious
+fn aggregate_usage(
+    events: &[crate::models::ActivityEvent],
+    cutoff: i64,
+) -> (UsageMap, DailyMap) {
+    let mut usage_map: UsageMap = UsageMap::new();
+    let mut daily_map: DailyMap = DailyMap::new();
+    for e in events {
+        if e.at < cutoff {
+            continue;
+        }
+        let date = shanghai_date(e.at).format("%Y-%m-%d").to_string();
+        let day = daily_map.entry(date).or_insert((0, 0, 0));
+        day.0 += 1; // openCount:窗口内全部事件
+        let Some(closed) = e.closed_at else { continue };
+        let raw = closed - e.at;
+        if raw <= 0 {
+            continue;
+        }
+        let suspicious = raw > MAX_SESSION_MS;
+        let duration = if suspicious { MAX_SESSION_MS } else { raw };
+        day.1 += 1; // closedCount
+        day.2 += duration;
+        let entry = usage_map
+            .entry(e.account_id.clone())
+            .or_insert_with(|| (0, Vec::new()));
+        entry.0 += duration;
+        entry.1.push(serde_json::json!({
+            "at": e.at,
+            "closedAt": closed,
+            "durationMs": duration,
+            "suspicious": suspicious,
+        }));
+    }
+    (usage_map, daily_map)
+}
+
+/// RFC4180 字段转义:含逗号/引号/换行时加引号并把内部引号翻倍
+fn csv_escape_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
 /// 近 30 天(含今天)打开次数,按 Asia/Shanghai 自然日划分
 fn count_opens_30d(events: &[crate::models::ActivityEvent], account_id: &str, now: i64) -> u32 {
     let today = shanghai_date(now);
@@ -1348,43 +1415,8 @@ pub async fn account_activity_list(
         })
         .collect();
 
-    // ===== A61:使用时长聚合(仅已关闭会话) =====
-    // 口径:duration = closedAt - at
-    //  - closedAt 为 None(未关闭/旧数据) 不计入时长,但仍计入打开次数
-    //  - duration <= 0 视为无效,忽略
-    //  - duration > 24h 记为 24h,并在该 session 标 suspicious(疑似未正常关闭)
-    const MAX_SESSION_MS: i64 = 24 * 3_600_000;
-    let mut usage_map: std::collections::BTreeMap<String, (i64, Vec<serde_json::Value>)> =
-        std::collections::BTreeMap::new();
-    let mut daily_map: std::collections::BTreeMap<String, (u32, u32, i64)> =
-        std::collections::BTreeMap::new();
-    for e in &activity.events {
-        if e.at < cutoff {
-            continue;
-        }
-        let date = shanghai_date(e.at).format("%Y-%m-%d").to_string();
-        let day = daily_map.entry(date).or_insert((0, 0, 0));
-        day.0 += 1; // openCount:窗口内全部事件
-        let Some(closed) = e.closed_at else { continue };
-        let raw = closed - e.at;
-        if raw <= 0 {
-            continue;
-        }
-        let suspicious = raw > MAX_SESSION_MS;
-        let duration = if suspicious { MAX_SESSION_MS } else { raw };
-        day.1 += 1; // closedCount
-        day.2 += duration;
-        let entry = usage_map
-            .entry(e.account_id.clone())
-            .or_insert_with(|| (0, Vec::new()));
-        entry.0 += duration;
-        entry.1.push(serde_json::json!({
-            "at": e.at,
-            "closedAt": closed,
-            "durationMs": duration,
-            "suspicious": suspicious,
-        }));
-    }
+    // ===== A61:使用时长聚合(仅已关闭会话,公式见 aggregate_usage) =====
+    let (usage_map, daily_map) = aggregate_usage(&activity.events, cutoff);
     let account_name = |id: &str| {
         accounts
             .iter()
@@ -1468,6 +1500,154 @@ pub async fn account_activity_list(
         "projectIndex": project_index,
         "generatedAt": crate::fs_utils::now_iso(),
     }))
+}
+
+/// 导出账号活动 CSV:流水表 + 按账号汇总表。
+/// 两个文件都写 UTF-8 BOM(EF BB BF),避免 Excel 打开中文乱码;
+/// 文件名含秒级时间戳,已存在时追加序号,不覆盖历史导出。
+#[tauri::command]
+pub fn export_activity_csv(
+    days: Option<u32>,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<String>> {
+    let accounts = {
+        let data = state.data.lock().unwrap();
+        data.get_accounts().to_vec()
+    };
+    let activity: crate::models::AccountActivityFile =
+        crate::fs_utils::read_json(&state.data_path("account_activity.json"));
+    let now = now_ms();
+    // days 语义与 account_activity_list 一致:0/None 之外按天回溯,默认 30
+    let window_days = days.unwrap_or(30);
+    let cutoff = if window_days == 0 {
+        i64::MIN
+    } else {
+        now - (window_days as i64) * 86_400_000
+    };
+    // 复用与界面统计完全相同的聚合公式
+    let (usage_map, _daily) = aggregate_usage(&activity.events, cutoff);
+    let account_name = |id: &str| {
+        accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.name.clone())
+            .unwrap_or_else(|| id.to_string())
+    };
+    let stamp = {
+        use chrono::TimeZone;
+        chrono::Utc
+            .timestamp_millis_opt(now)
+            .single()
+            .map(|d| {
+                d.with_timezone(&chrono_tz::Asia::Shanghai)
+                    .format("%Y%m%d_%H%M%S")
+                    .to_string()
+            })
+            .unwrap_or_else(|| format!("{now}"))
+    };
+    let make_path = |prefix: &str| -> std::path::PathBuf {
+        let mut p = state.data_path(&format!("{prefix}_{stamp}.csv"));
+        let mut i = 1;
+        while p.exists() {
+            p = state.data_path(&format!("{prefix}_{stamp}_{i}.csv"));
+            i += 1;
+        }
+        p
+    };
+
+    // ---- 流水表(按 openedAt 升序) ----
+    let mut rows: Vec<&crate::models::ActivityEvent> =
+        activity.events.iter().filter(|e| e.at >= cutoff).collect();
+    rows.sort_by_key(|e| e.at);
+    let mut events_csv = String::from(
+        "\u{feff}date,time,accountId,accountName,entry,openedAt,closedAt,durationMin,suspicious,tags\n",
+    );
+    for e in &rows {
+        let (closed_at, duration_min, suspicious) = match e.closed_at {
+            Some(c) if c - e.at > 0 => {
+                let raw = c - e.at;
+                let suspicious = raw > MAX_SESSION_MS;
+                let dur = if suspicious { MAX_SESSION_MS } else { raw };
+                (
+                    c.to_string(),
+                    format!("{:.2}", dur as f64 / 60_000.0),
+                    suspicious.to_string(),
+                )
+            }
+            _ => (String::new(), "0.00".to_string(), "false".to_string()),
+        };
+        events_csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{}\n",
+            shanghai_date(e.at).format("%Y-%m-%d"),
+            shanghai_local(e.at, false),
+            csv_escape_field(&e.account_id),
+            csv_escape_field(&account_name(&e.account_id)),
+            csv_escape_field(&e.entry),
+            e.at,
+            closed_at,
+            duration_min,
+            suspicious,
+            csv_escape_field(&e.tags_snapshot.join(";")),
+        ));
+    }
+
+    // ---- 按账号汇总(table:openCount 含未关闭;sessions/total 仅已关闭) ----
+    let mut open_counts: std::collections::BTreeMap<String, (u32, i64)> =
+        std::collections::BTreeMap::new();
+    for e in &activity.events {
+        if e.at < cutoff {
+            continue;
+        }
+        let ent = open_counts.entry(e.account_id.clone()).or_insert((0, e.at));
+        ent.0 += 1;
+        if e.at > ent.1 {
+            ent.1 = e.at;
+        }
+    }
+    let mut ids: std::collections::BTreeSet<String> = open_counts.keys().cloned().collect();
+    ids.extend(usage_map.keys().cloned());
+    let mut summary_rows: Vec<(String, u32, usize, i64, i64)> = ids
+        .into_iter()
+        .map(|id| {
+            let (opens, last) = open_counts.get(&id).copied().unwrap_or((0, 0));
+            let (total, sessions) = usage_map
+                .get(&id)
+                .map(|(t, s)| (*t, s.len()))
+                .unwrap_or((0, 0));
+            (id, opens, sessions, total, last)
+        })
+        .collect();
+    summary_rows.sort_by(|a, b| b.3.cmp(&a.3));
+    let mut summary_csv = String::from(
+        "\u{feff}accountId,accountName,openCount,sessionCount,totalMin,lastOpenedAt,lastOpenedLocal\n",
+    );
+    for (id, opens, sessions, total, last) in summary_rows {
+        summary_csv.push_str(&format!(
+            "{},{},{},{},{},{},{}\n",
+            csv_escape_field(&id),
+            csv_escape_field(&account_name(&id)),
+            opens,
+            sessions,
+            format!("{:.2}", total as f64 / 60_000.0),
+            last,
+            if last > 0 {
+                shanghai_local(last, true)
+            } else {
+                String::new()
+            },
+        ));
+    }
+
+    let events_path = make_path("activity_events");
+    let summary_path = make_path("activity_summary");
+    std::fs::write(&events_path, events_csv.as_bytes())
+        .map_err(|e| AppError::Launch(format!("写入流水 CSV 失败: {e}")))?;
+    std::fs::write(&summary_path, summary_csv.as_bytes())
+        .map_err(|e| AppError::Launch(format!("写入汇总 CSV 失败: {e}")))?;
+    Ok(vec![
+        events_path.to_string_lossy().to_string(),
+        summary_path.to_string_lossy().to_string(),
+    ])
 }
 
 /// 读取 UI 偏好(视图/主题记忆);文件不存在返回默认值
@@ -2206,6 +2386,15 @@ pub fn import_account_from_dir(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn csv_field_escapes_comma_quote_newline() {
+        assert_eq!(csv_escape_field("plain"), "plain");
+        assert_eq!(csv_escape_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_escape_field("a\"b"), "\"a\"\"b\"");
+        assert_eq!(csv_escape_field("a\nb"), "\"a\nb\"");
+        assert_eq!(csv_escape_field("标签A;标签,含逗号"), "\"标签A;标签,含逗号\"");
+    }
 
     fn case_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

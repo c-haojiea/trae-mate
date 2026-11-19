@@ -48,6 +48,15 @@
           {{ a.name }}
         </option>
       </select>
+      <!-- 统计视图:导出当前窗口的流水 + 汇总 CSV -->
+      <button
+        v-if="view === 'stats'"
+        class="btn btn-sm btn-primary"
+        :disabled="exporting"
+        @click="doExport"
+      >
+        {{ exporting ? '导出中…' : '导出 CSV' }}
+      </button>
     </div>
 
     <p class="act-hint">标签为手动维护，用于标记该账号的用途；项目路径自动提取在 SOLO 模式下常为空。历史记录显示的是打开当时的标签。</p>
@@ -471,7 +480,24 @@ function statusText(a: ActivityAccount) {
   return `${base} · ${(left / 86_400_000).toFixed(1)}d`
 }
 
-// ===== A61:统计视图 =====
+// ===== A62:导出当前窗口的 CSV(流水 + 汇总) =====
+const exporting = ref(false)
+
+async function doExport() {
+  if (exporting.value) return
+  exporting.value = true
+  try {
+    const paths = await store.exportActivityCsv(days.value)
+    const names = paths.map((p) => p.split(/[\\/]/).pop() || p)
+    emit('notify', `已导出：${names.join('、')}`, 'success')
+  } catch (e: any) {
+    emit('notify', String(e?.message || e || '导出失败'), 'error')
+  } finally {
+    exporting.value = false
+  }
+}
+
+// ===== 统计视图 =====
 const showAllUsage = ref(false)
 const expandedUsage = ref<string | null>(null)
 const projectQuery = ref('')
