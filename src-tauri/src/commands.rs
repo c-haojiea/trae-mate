@@ -1015,6 +1015,8 @@ pub async fn get_all_instance_states(
     };
     let main = trae_machine::probe_main_instance();
     let mut map = serde_json::Map::new();
+    let mut new_running: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
     for account in &accounts {
         let source = trae_machine::account_state(account, &main);
         let is_main_account = main.1.as_deref()
@@ -1022,22 +1024,42 @@ pub async fn get_all_instance_states(
                 .desktop_user_id
                 .as_deref()
                 .filter(|s| !s.is_empty());
+        let running = !matches!(source, trae_machine::InstanceSource::None);
         let st = InstanceState {
-            running: !matches!(source, trae_machine::InstanceSource::None),
+            running,
             source,
             is_main_account,
         };
         if let Ok(v) = serde_json::to_value(st) {
             map.insert(account.id.clone(), v);
         }
+        new_running.insert(account.id.clone(), running);
     }
+
+    // 状态迁移检测:旧=true 且 新=false → 实例已被用户关闭,给最近事件补 closedAt
+    // 注:不持有 data 锁;返回的 map 已构建完成
+    let (now, closed_ids) = {
+        let mut last = state.last_instance_running.lock().unwrap();
+        let now = now_ms();
+        let closed_ids: Vec<String> = new_running
+            .iter()
+            .filter(|(id, running)| !**running && last.get(*id).copied().unwrap_or(false))
+            .map(|(id, _)| id.clone())
+            .collect();
+        *last = new_running;
+        (now, closed_ids)
+    };
+    for id in closed_ids {
+        close_latest_activity(state.inner(), &id, now);
+    }
+
     Ok(serde_json::Value::Object(map))
 }
 
 // ===== A55:账号活动(打开事件 / 标签 / 最近项目) =====
 
 /// 打开事件文件最多保留的条数(超出丢最旧)
-const ACTIVITY_MAX_EVENTS: usize = 1000;
+const ACTIVITY_MAX_EVENTS: usize = 5000;
 
 /// 标签规范化:去空白、去重、单标签 ≤24 字符、最多 8 个;超限返回中文错误
 fn normalize_tags(tags: &[String]) -> Result<Vec<String>, String> {
@@ -1060,7 +1082,7 @@ fn normalize_tags(tags: &[String]) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// 事件裁剪:只保留最近 1000 条
+/// 事件裁剪:只保留最近 5000 条
 fn trim_events(mut events: Vec<crate::models::ActivityEvent>) -> Vec<crate::models::ActivityEvent> {
     if events.len() > ACTIVITY_MAX_EVENTS {
         let drop = events.len() - ACTIVITY_MAX_EVENTS;
@@ -1076,15 +1098,55 @@ fn append_activity(
     desktop_user_id: Option<&str>,
     entry: &str,
 ) {
+    // 标签快照在 data 锁内先取好,再进 activity_lock,避免两把锁嵌套形成死锁风险
+    let tags_snapshot = {
+        let data = state.data.lock().unwrap();
+        data.get_accounts()
+            .iter()
+            .find(|a| a.id == account_id)
+            .map(|a| a.tags.clone())
+            .unwrap_or_default()
+    };
     let path = state.data_path("account_activity.json");
+    // 整段读-改-写持锁,避免并发 append 互相覆盖丢事件
+    let _guard = state.activity_lock.lock().unwrap();
     let mut file: crate::models::AccountActivityFile = crate::fs_utils::read_json(&path);
     file.events.push(crate::models::ActivityEvent {
         account_id: account_id.to_string(),
         desktop_user_id: desktop_user_id.map(str::to_string),
         at: now_ms(),
         entry: entry.to_string(),
+        closed_at: None,
+        tags_snapshot,
     });
     file.events = trim_events(file.events);
+    if let Err(e) = crate::fs_utils::write_json(&path, &file) {
+        crate::fs_utils::app_log(&state.data_dir, &format!("写入账号活动失败: {e}"));
+    }
+}
+
+/// 给该账号最近一条尚未关闭的事件补 closedAt(实例 running true→false 时调用)
+fn close_latest_activity(state: &AppState, account_id: &str, at: i64) {
+    let path = state.data_path("account_activity.json");
+    let _guard = state.activity_lock.lock().unwrap();
+    let mut file: crate::models::AccountActivityFile = crate::fs_utils::read_json(&path);
+    let updated = {
+        let target = file
+            .events
+            .iter_mut()
+            .filter(|e| e.account_id == account_id && e.closed_at.is_none())
+            .max_by_key(|e| e.at);
+        match target {
+            Some(e) => {
+                e.closed_at = Some(at);
+                true
+            }
+            None => false,
+        }
+    };
+    if !updated {
+        return;
+    }
     if let Err(e) = crate::fs_utils::write_json(&path, &file) {
         crate::fs_utils::app_log(&state.data_dir, &format!("写入账号活动失败: {e}"));
     }
@@ -1238,17 +1300,24 @@ pub async fn account_activity_list(state: State<'_, AppState>) -> AppResult<serd
                 .find(|a| a.id == e.account_id)
                 .map(|a| a.name.clone())
                 .unwrap_or_else(|| e.account_id.clone());
-            let tags = accounts
+            let current_tags = accounts
                 .iter()
                 .find(|a| a.id == e.account_id)
                 .map(|a| a.tags.clone())
                 .unwrap_or_default();
+            // 优先用打开当时的标签快照;旧事件无快照时才回退到当前标签
+            let tags = if e.tags_snapshot.is_empty() {
+                current_tags
+            } else {
+                e.tags_snapshot.clone()
+            };
             serde_json::json!({
                 "accountId": e.account_id,
                 "name": name,
                 "tags": tags,
                 "at": e.at,
                 "entry": e.entry,
+                "closedAt": e.closed_at,
             })
         })
         .collect();
@@ -2508,6 +2577,8 @@ mod tests {
             desktop_user_id: None,
             at: ms,
             entry: "card".to_string(),
+            closed_at: None,
+            tags_snapshot: Vec::new(),
         };
         let events = vec![
             ev(now),
@@ -2520,23 +2591,25 @@ mod tests {
         assert_eq!(count_opens_30d(&events, "other", now), 0, "其它账号不计入");
     }
 
-    /// A55:事件超 1000 条时只保留最近 1000 条(丢最旧)
+    /// A58:事件超 5000 条时只保留最近 5000 条(丢最旧)
     #[test]
-    fn activity_events_are_capped_at_1000() {
-        let events: Vec<crate::models::ActivityEvent> = (0..1005)
+    fn trim_events_keeps_5000() {
+        let events: Vec<crate::models::ActivityEvent> = (0..5001)
             .map(|i| crate::models::ActivityEvent {
                 account_id: format!("a{i}"),
                 desktop_user_id: None,
                 at: i as i64,
                 entry: "card".to_string(),
+                closed_at: None,
+                tags_snapshot: Vec::new(),
             })
             .collect();
 
         let trimmed = trim_events(events);
 
-        assert_eq!(trimmed.len(), 1000, "必须裁剪到 1000 条");
-        assert_eq!(trimmed.first().unwrap().at, 5, "丢最旧 5 条");
-        assert_eq!(trimmed.last().unwrap().at, 1004, "保留最新");
+        assert_eq!(trimmed.len(), 5000, "必须裁剪到 5000 条");
+        assert_eq!(trimmed.first().unwrap().at, 1, "丢最旧 1 条");
+        assert_eq!(trimmed.last().unwrap().at, 5000, "保留最新");
     }
 
     /// A42①:只有 cloudide 键 → 已登录
@@ -2570,5 +2643,101 @@ mod tests {
         assert!(!eval_storage_logged_in(
             &serde_json::json!({"iCubeAuthInfo://icube.cloudide": ""})
         ));
+    }
+
+    /// A58:构造独立 AppState(临时 data_dir)
+    fn activity_state(tag: &str) -> (AppState, PathBuf) {
+        let root = case_dir(tag);
+        let state = AppState {
+            data: std::sync::Mutex::new(crate::store::StoreData::default()),
+            path: root.join("data.json"),
+            data_dir: root.join("appdata"),
+            jwt_refresh_lock: tokio::sync::Mutex::new(()),
+            activity_lock: std::sync::Mutex::new(()),
+            last_instance_running: std::sync::Mutex::new(std::collections::HashMap::new()),
+        };
+        (state, root)
+    }
+
+    /// A58:append 写入打开当时的标签快照,closedAt 为空
+    #[test]
+    fn append_records_tags_snapshot() {
+        let (state, root) = activity_state("activity_snapshot");
+        state.data.lock().unwrap().accounts.push(Account {
+            id: "a1".to_string(),
+            name: "测试号".to_string(),
+            tags: vec!["A".to_string(), "B".to_string()],
+            ..Default::default()
+        });
+
+        append_activity(&state, "a1", None, "card");
+
+        let file: crate::models::AccountActivityFile =
+            crate::fs_utils::read_json(&state.data_path("account_activity.json"));
+        assert_eq!(file.events.len(), 1);
+        assert_eq!(
+            file.events[0].tags_snapshot,
+            vec!["A".to_string(), "B".to_string()],
+            "标签快照取 append 当时的账号标签"
+        );
+        assert!(file.events[0].closed_at.is_none(), "新事件 closedAt 为空");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A58:close_latest 只给最近一条未关闭事件补 closedAt
+    #[test]
+    fn close_latest_sets_only_latest_open_event() {
+        let (state, root) = activity_state("activity_close");
+        let ev = |at: i64| crate::models::ActivityEvent {
+            account_id: "a1".to_string(),
+            desktop_user_id: None,
+            at,
+            entry: "card".to_string(),
+            closed_at: None,
+            tags_snapshot: Vec::new(),
+        };
+        let path = state.data_path("account_activity.json");
+        crate::fs_utils::write_json(
+            &path,
+            &crate::models::AccountActivityFile {
+                events: vec![ev(100), ev(200)],
+            },
+        )
+        .unwrap();
+
+        close_latest_activity(&state, "a1", 999);
+
+        let got: crate::models::AccountActivityFile = crate::fs_utils::read_json(&path);
+        assert_eq!(got.events.len(), 2);
+        assert!(got.events[0].closed_at.is_none(), "较早事件保持未关闭");
+        assert_eq!(got.events[1].closed_at, Some(999), "只关闭最近一条");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A58:没有未关闭事件时 close_latest 保持文件不变
+    #[test]
+    fn close_latest_noop_when_all_closed() {
+        let (state, root) = activity_state("activity_close_noop");
+        let path = state.data_path("account_activity.json");
+        crate::fs_utils::write_json(
+            &path,
+            &crate::models::AccountActivityFile {
+                events: vec![crate::models::ActivityEvent {
+                    account_id: "a1".to_string(),
+                    desktop_user_id: None,
+                    at: 100,
+                    entry: "card".to_string(),
+                    closed_at: Some(150),
+                    tags_snapshot: Vec::new(),
+                }],
+            },
+        )
+        .unwrap();
+
+        close_latest_activity(&state, "a1", 999);
+
+        let got: crate::models::AccountActivityFile = crate::fs_utils::read_json(&path);
+        assert_eq!(got.events[0].closed_at, Some(150), "已关闭事件不被覆盖");
+        let _ = fs::remove_dir_all(&root);
     }
 }

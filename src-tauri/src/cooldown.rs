@@ -195,6 +195,8 @@ mod tests {
             path: tmp.join("data.json"),
             data_dir: tmp.clone(),
             jwt_refresh_lock: tokio::sync::Mutex::new(()),
+            activity_lock: std::sync::Mutex::new(()),
+            last_instance_running: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let now = now_secs();
 

@@ -110,6 +110,8 @@ pub fn run() {
                 path,
                 data_dir: app_data,
                 jwt_refresh_lock: tokio::sync::Mutex::new(()),
+                activity_lock: std::sync::Mutex::new(()),
+                last_instance_running: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
             app.manage(reqwest::Client::new());
             app.manage(scheduler::SchedulerState::default());

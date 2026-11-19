@@ -25,6 +25,10 @@ pub struct AppState {
     pub data_dir: PathBuf,
     /// JWT 刷新锁:防止多个并发请求同时 ExchangeToken(用 tokio Mutex,持锁可跨 await)
     pub jwt_refresh_lock: tokio::sync::Mutex<()>,
+    /// 账号活动文件读写锁:避免并发 append 互相覆盖丢事件
+    pub activity_lock: Mutex<()>,
+    /// 上一轮实例运行状态(accountId → running),用于检测 running true→false 补 closedAt
+    pub last_instance_running: Mutex<std::collections::HashMap<String, bool>>,
 }
 
 impl AppState {

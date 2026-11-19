@@ -968,6 +968,8 @@ mod e2e_tests {
             path: tmp.join("data.json"),
             data_dir: tmp.clone(),
             jwt_refresh_lock: tokio::sync::Mutex::new(()),
+            activity_lock: std::sync::Mutex::new(()),
+            last_instance_running: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         let client = reqwest::Client::new();
         let outcome = checkin_engine(&state, &account, &client).await;

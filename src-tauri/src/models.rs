@@ -172,6 +172,12 @@ pub struct ActivityEvent {
     pub at: i64,
     /// 入口:"card"(账号卡片) | "tray"(托盘) | "launch"(其它)
     pub entry: String,
+    /// 实例关闭时间(毫秒)。拿不到时为 None(旧事件恒为 None)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<i64>,
+    /// 打开瞬间的账号标签快照;旧事件为空数组
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags_snapshot: Vec<String>,
 }
 
 /// 账号打开事件文件
@@ -563,6 +569,17 @@ mod tests {
         s.merge(p);
         assert!(!s.credits_snapshot_enabled, "只传时间不得改动开关");
         assert_eq!(s.credits_snapshot_time, "21:30");
+    }
+
+    /// 旧事件(无 closedAt/tagsSnapshot 字段)必须能读入:closed_at=None、tags_snapshot 为空
+    #[test]
+    fn activity_event_legacy_without_new_fields_deserializes() {
+        let legacy = r#"{"accountId":"a1","desktopUserId":"u1","at":1730000000000,"entry":"card"}"#;
+        let e: ActivityEvent = serde_json::from_str(legacy).unwrap();
+        assert_eq!(e.account_id, "a1");
+        assert_eq!(e.at, 1730000000000);
+        assert!(e.closed_at.is_none(), "旧事件 closedAt 为 None");
+        assert!(e.tags_snapshot.is_empty(), "旧事件标签快照为空数组");
     }
 
     /// 只传开关时:时间保持原值

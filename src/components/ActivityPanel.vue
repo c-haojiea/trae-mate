@@ -29,7 +29,7 @@
       </button>
     </div>
 
-    <p class="act-hint">标签为手动维护，用于标记该账号的用途；项目路径自动提取在 SOLO 模式下常为空。</p>
+    <p class="act-hint">标签为手动维护，用于标记该账号的用途；项目路径自动提取在 SOLO 模式下常为空。历史记录显示的是打开当时的标签。</p>
 
     <!-- 无打开记录提示(仍保留账号列表以便维护标签) -->
     <div v-if="!loading && store.activityEvents.length === 0" class="act-empty-hint">
