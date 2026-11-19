@@ -13,6 +13,13 @@
           <span class="badge" :class="statusBadgeClass">
             {{ statusText }}
           </span>
+          <!-- A59:账号标签入口(点击打开标签编辑弹窗) -->
+          <div class="tag-row" @click.stop="openTagEditor">
+            <template v-if="account.tags && account.tags.length">
+              <span v-for="t in account.tags" :key="t" class="tag-chip">{{ t }}</span>
+            </template>
+            <span v-else class="tag-chip add">+ 标签</span>
+          </div>
         </div>
       </div>
       <div class="switch" :class="{ active: account.enabled }" @click="handleToggle">
@@ -127,10 +134,29 @@
       <div class="edit-actions"><button class="btn btn-sm btn-outline" @click="cancelEdit">取消</button><button class="btn btn-sm btn-primary" @click="saveEdit">保存</button></div>
     </div>
   </div>
+  <!-- A59:标签编辑弹窗(与账号活动页 act-mask/act-editor 保持同一观感) -->
+  <div v-if="tagEditing" class="act-mask" @click.self="closeTagEditor">
+    <div class="act-editor">
+      <h3>{{ account.name }} · 标签</h3>
+      <p class="act-editor-hint">用逗号或回车分隔，最多 8 个，单个不超过 24 字</p>
+      <input
+        ref="tagInput"
+        v-model="tagText"
+        class="input"
+        type="text"
+        placeholder="例如：Anki分析, 视频下载器"
+        @keydown.enter.prevent="saveTags"
+      />
+      <div class="act-editor-actions">
+        <button class="btn btn-sm btn-outline" @click="closeTagEditor">取消</button>
+        <button class="btn btn-sm btn-primary" :disabled="tagSaving" @click="saveTags">保存</button>
+      </div>
+    </div>
+  </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, watch, nextTick } from 'vue'
 import { useAppStore, type Account, type InstanceState } from '../stores/app'
 
 const props = defineProps<{
@@ -346,9 +372,44 @@ async function handleClearCooldown() {
   }
 }
 
-function startEdit() { draftName.value = props.account.name; editing.value = true }
+function startEdit() { tagEditing.value = false; draftName.value = props.account.name; editing.value = true }
 function cancelEdit() { editing.value = false }
 function saveEdit() { const name = draftName.value.trim(); if (name && name !== props.account.name) emit('edit', props.account.id, name); editing.value = false }
+
+// ===== A59:标签编辑(与账号活动页同一交互) =====
+const tagEditing = ref(false)
+const tagText = ref('')
+const tagSaving = ref(false)
+const tagInput = ref<HTMLInputElement | null>(null)
+
+function openTagEditor() {
+  editing.value = false
+  tagText.value = (props.account.tags || []).join(', ')
+  tagEditing.value = true
+  nextTick(() => tagInput.value?.focus())
+}
+
+function closeTagEditor() {
+  tagEditing.value = false
+}
+
+async function saveTags() {
+  if (tagSaving.value) return
+  const tags = tagText.value
+    .split(/[,，\n]/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+  tagSaving.value = true
+  try {
+    await store.updateAccountTags(props.account.id, tags)
+    emit('notify', '标签已保存', 'success')
+    tagEditing.value = false
+  } catch (e: any) {
+    emit('notify', String(e?.message || e || '保存标签失败'), 'error')
+  } finally {
+    tagSaving.value = false
+  }
+}
 
 
 function formatDate(timestamp: number): string {
@@ -509,6 +570,40 @@ function formatDateTime(timestamp: number): string {
   white-space: nowrap;
 }
 
+/* A59:标签行(点击打开标签编辑) */
+.tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  min-height: 18px;
+  cursor: pointer;
+}
+
+.tag-chip {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  font-size: 11px;
+  color: var(--text-secondary);
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tag-chip.add {
+  border-style: dashed;
+  opacity: 0.8;
+}
+
+.tag-row:hover .tag-chip.add {
+  opacity: 1;
+  color: var(--accent);
+}
+
 /* 卡片内容区 - 纯靠间距与底部按钮区分隔,不用边框线(Neumorphism 无 border) */
 .card-body {
   margin-bottom: 18px;
@@ -660,6 +755,50 @@ function formatDateTime(timestamp: number): string {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+/* A59:标签弹窗(观感与账号活动页 act-mask/act-editor 一致) */
+.act-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 60;
+}
+
+.act-editor {
+  width: 360px;
+  max-width: 90vw;
+  border-radius: 12px;
+  padding: 16px;
+  background: var(--bg-primary, #fff);
+  border: 1px solid var(--border-color);
+}
+
+.act-editor h3 {
+  margin: 0 0 6px;
+  font-size: 15px;
+  color: var(--text-primary);
+}
+
+.act-editor-hint {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.act-editor .input {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.act-editor-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
 }
 
 @keyframes spin {

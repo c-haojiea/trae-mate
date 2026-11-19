@@ -1267,6 +1267,9 @@ pub async fn account_activity_list(state: State<'_, AppState>) -> AppResult<serd
     };
     let activity: crate::models::AccountActivityFile =
         crate::fs_utils::read_json(&state.data_path("account_activity.json"));
+    // 余额展示:与账号卡片共用 remaining_credits.json,key 与 effective_user_id 一致
+    let rc: crate::models::RemainingCreditsFile =
+        crate::fs_utils::read_json(&state.data_path("remaining_credits.json"));
     let now = now_ms();
 
     let mut list: Vec<serde_json::Value> = Vec::new();
@@ -1277,6 +1280,7 @@ pub async fn account_activity_list(state: State<'_, AppState>) -> AppResult<serd
             .filter(|e| e.account_id == a.id)
             .map(|e| e.at)
             .max();
+        let balance = effective_user_id(a).and_then(|uid| rc.credits.get(uid).copied());
         list.push(serde_json::json!({
             "id": a.id,
             "name": a.name,
@@ -1285,6 +1289,9 @@ pub async fn account_activity_list(state: State<'_, AppState>) -> AppResult<serd
             "lastOpenedAt": last_opened,
             "openCount30d": count_opens_30d(&activity.events, &a.id, now),
             "projects": account_projects(a.data_dir.as_deref()),
+            "balance": balance,
+            "expiresAt": a.expires_at,
+            "credentialStatus": a.credential_status,
         }));
     }
 

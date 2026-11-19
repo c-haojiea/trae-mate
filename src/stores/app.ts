@@ -136,6 +136,9 @@ export interface ActivityProject {
   lastActive: number
 }
 
+/** 「账号活动」页视图记忆的 localStorage key(持久化在组件侧完成) */
+export const ACTIVITY_VIEW_KEY = 'traemate.activity.view'
+
 /** 「账号活动」页的账号条目 */
 export interface ActivityAccount {
   id: string
@@ -145,6 +148,12 @@ export interface ActivityAccount {
   lastOpenedAt: number | null
   openCount30d: number
   projects: ActivityProject[]
+  /** 当前余额(remaining_credits.json),无记录为 null */
+  balance?: number | null
+  /** 令牌到期时间(毫秒),未知为 null */
+  expiresAt?: number | null
+  /** 桌面凭证状态 */
+  credentialStatus?: string | null
 }
 
 /** 时间线事件(按 at 倒序) */

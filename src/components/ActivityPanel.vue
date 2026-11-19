@@ -29,6 +29,27 @@
       </button>
     </div>
 
+    <!-- 时间线筛选(仅时间线视图) -->
+    <div v-if="view === 'timeline'" class="act-filters">
+      <div class="act-range">
+        <button
+          v-for="r in ranges"
+          :key="r.key"
+          class="act-range-btn"
+          :class="{ active: timelineRange === r.key }"
+          @click="timelineRange = r.key"
+        >
+          {{ r.label }}
+        </button>
+      </div>
+      <select v-model="timelineAccount" class="act-select">
+        <option value="">全部账号</option>
+        <option v-for="a in timelineAccountOptions" :key="a.id" :value="a.id">
+          {{ a.name }}
+        </option>
+      </select>
+    </div>
+
     <p class="act-hint">标签为手动维护，用于标记该账号的用途；项目路径自动提取在 SOLO 模式下常为空。历史记录显示的是打开当时的标签。</p>
 
     <!-- 无打开记录提示(仍保留账号列表以便维护标签) -->
@@ -47,6 +68,7 @@
       <div class="act-list-head">
         <span class="col-name">账号</span>
         <span class="col-tags">标签</span>
+        <span class="col-status">状态</span>
         <span class="col-time">最近打开</span>
         <span class="col-count">近30天</span>
         <span class="col-proj">最近项目</span>
@@ -59,6 +81,7 @@
           </template>
           <span v-else class="act-tag add">+ 标签</span>
         </span>
+        <span class="col-status" :class="{ 'status-off': !a.enabled }">{{ statusText(a) }}</span>
         <span class="col-time">{{ fmtRel(a.lastOpenedAt) }}</span>
         <span class="col-count">{{ a.openCount30d }}</span>
         <span class="col-proj" :title="projectTitle(a)">
@@ -96,11 +119,21 @@
             <b v-else class="act-none">—</b>
           </div>
         </div>
+        <div class="act-card-foot">
+          <span class="badge" :class="a.enabled ? 'badge-success' : 'badge-muted'">
+            {{ a.enabled ? '启用' : '停用' }}
+          </span>
+          <span class="act-foot-item" title="当前余额">余额 {{ fmtBalance(a.balance) }}</span>
+          <span class="act-foot-item" :class="expireClass(a.expiresAt)" title="令牌到期">
+            令牌 {{ fmtExpire(a.expiresAt) }}
+          </span>
+        </div>
       </div>
     </div>
 
     <!-- 时间线视图 -->
     <div v-else class="act-timeline">
+      <div v-if="filteredTimeline.length === 0" class="act-empty-hint">该范围内没有打开记录</div>
       <template v-for="g in timelineGroups" :key="g.date">
         <div class="act-day">{{ g.label }}</div>
         <div v-for="(e, i) in g.items" :key="g.date + '-' + i" class="act-event">
@@ -137,8 +170,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onActivated, onMounted, ref } from 'vue'
-import { useAppStore, type ActivityAccount } from '../stores/app'
+import { computed, nextTick, onActivated, onMounted, ref, watch } from 'vue'
+import { ACTIVITY_VIEW_KEY, useAppStore, type ActivityAccount } from '../stores/app'
 import Icon from './Icon.vue'
 
 const emit = defineEmits(['notify'])
@@ -148,7 +181,19 @@ const loading = ref(false)
 const search = ref('')
 const sortBy = ref<'recent' | 'name' | 'count'>('recent')
 const onlyTagged = ref(false)
-const view = ref<'list' | 'card' | 'timeline'>('list')
+
+const activityViews = ['list', 'card', 'timeline'] as const
+type ActivityView = (typeof activityViews)[number]
+
+// 视图记忆:仅接受已知视图值,非法值回退列表视图
+function loadSavedView(): ActivityView {
+  const saved = localStorage.getItem(ACTIVITY_VIEW_KEY)
+  return saved && (activityViews as readonly string[]).includes(saved)
+    ? (saved as ActivityView)
+    : 'list'
+}
+const view = ref<ActivityView>(loadSavedView())
+watch(view, (v) => localStorage.setItem(ACTIVITY_VIEW_KEY, v))
 
 const views = [
   { key: 'list' as const, label: '列表' },
@@ -188,10 +233,55 @@ const filtered = computed(() => {
   return list
 })
 
+// ===== 时间线筛选 =====
+const ranges = [
+  { key: 'today', label: '今天' },
+  { key: '7d', label: '近7天' },
+  { key: '30d', label: '近30天' },
+  { key: 'all', label: '全部' },
+] as const
+const timelineRange = ref<'today' | '7d' | '30d' | 'all'>('today')
+const timelineAccount = ref('')
+
+// 账号下拉:仅列出有事件的账号,按最近打开倒序
+const timelineAccountOptions = computed(() =>
+  store.activityAccounts
+    .filter((a) => store.activityEvents.some((e) => e.accountId === a.id))
+    .slice()
+    .sort((a, b) => (b.lastOpenedAt || 0) - (a.lastOpenedAt || 0))
+)
+
+// Asia/Shanghai 固定 UTC+8(无夏令时),返回该毫秒时刻所属自然日的 0 点
+function startOfShanghaiDay(ms: number) {
+  const shifted = new Date(ms + 8 * 3_600_000)
+  const dayStartUtc = Date.UTC(
+    shifted.getUTCFullYear(),
+    shifted.getUTCMonth(),
+    shifted.getUTCDate()
+  )
+  return dayStartUtc - 8 * 3_600_000
+}
+
+const filteredTimeline = computed(() => {
+  const now = Date.now()
+  const cutoff =
+    timelineRange.value === 'today'
+      ? startOfShanghaiDay(now)
+      : timelineRange.value === '7d'
+        ? now - 7 * 86_400_000
+        : timelineRange.value === '30d'
+          ? now - 30 * 86_400_000
+          : 0
+  return store.activityEvents.filter(
+    (e) =>
+      e.at >= cutoff && (!timelineAccount.value || e.accountId === timelineAccount.value)
+  )
+})
+
 // 时间线:按上海自然日分组(后端已按 at 倒序)
 const timelineGroups = computed(() => {
   const groups: { date: string; label: string; items: typeof store.activityEvents }[] = []
-  for (const e of store.activityEvents) {
+  for (const e of filteredTimeline.value) {
     const d = new Date(e.at)
     const date = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' })
     let g = groups.find((x) => x.date === date)
@@ -237,6 +327,38 @@ function baseName(p: string) {
 
 function projectTitle(a: ActivityAccount) {
   return a.projects.map((p) => p.path).join('\n')
+}
+
+// ===== A59:余额 / 令牌到期 / 状态 =====
+function fmtBalance(v?: number | null) {
+  return v == null ? '—' : v.toFixed(2)
+}
+
+function fmtExpire(ms?: number | null) {
+  if (!ms) return '—'
+  const d = new Date(ms)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+// <3 天红、<7 天橙,复用现有主题色变量
+function expireClass(ms?: number | null) {
+  if (!ms) return ''
+  const left = ms - Date.now()
+  if (left <= 0) return 'text-danger'
+  const days = left / 86_400_000
+  if (days < 3) return 'text-danger'
+  if (days < 7) return 'text-warning'
+  return ''
+}
+
+// 列表「状态」列:启用/停用 + 令牌剩余天数(如「9.5d」)
+function statusText(a: ActivityAccount) {
+  const base = a.enabled ? '启用' : '停用'
+  if (!a.expiresAt) return `${base} · —`
+  const left = a.expiresAt - Date.now()
+  if (left <= 0) return `${base} · 已过期`
+  return `${base} · ${(left / 86_400_000).toFixed(1)}d`
 }
 
 // ===== 标签编辑 =====
@@ -307,6 +429,36 @@ async function saveTags() {
   font-size: 13px;
 }
 
+/* 时间线筛选条 */
+.act-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.act-range {
+  display: inline-flex;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.act-range-btn {
+  padding: 6px 12px;
+  font-size: 12px;
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.act-range-btn.active {
+  background: var(--accent-color, #3b82f6);
+  color: #fff;
+}
+
 .act-check {
   display: flex;
   align-items: center;
@@ -362,7 +514,7 @@ async function saveTags() {
 .act-list-head,
 .act-row {
   display: grid;
-  grid-template-columns: 1.3fr 1.6fr 0.9fr 0.6fr 1.2fr;
+  grid-template-columns: 1.2fr 1.5fr 1fr 0.85fr 0.55fr 1.2fr;
   gap: 10px;
   align-items: center;
   padding: 9px 12px;
@@ -391,6 +543,31 @@ async function saveTags() {
 .col-time,
 .col-count {
   color: var(--text-secondary);
+}
+
+.col-status {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.col-status.status-off {
+  color: var(--text-muted);
+  opacity: 0.8;
+}
+
+/* 窄窗口:隐藏「状态」列,避免挤压其它列 */
+@media (max-width: 680px) {
+  .act-list-head,
+  .act-row {
+    grid-template-columns: 1.2fr 1.4fr 0.9fr 0.55fr 1.2fr;
+  }
+
+  .col-status {
+    display: none;
+  }
 }
 
 .col-proj {
@@ -483,6 +660,31 @@ async function saveTags() {
   text-overflow: ellipsis;
   white-space: nowrap;
   text-align: right;
+}
+
+/* 卡片底部:启用状态 / 余额 / 令牌到期 */
+.act-card-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-color);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.act-foot-item {
+  white-space: nowrap;
+}
+
+.text-danger {
+  color: var(--danger);
+}
+
+.text-warning {
+  color: var(--warning);
 }
 
 .act-timeline {
