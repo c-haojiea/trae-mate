@@ -297,6 +297,9 @@ pub fn run() {
             commands::credits_daily_list,
             commands::credits_export_csv,
             commands::open_url,
+            // UI 偏好持久化(视图/主题记忆)
+            commands::ui_state_get,
+            commands::ui_state_set,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

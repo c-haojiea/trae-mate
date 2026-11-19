@@ -185,15 +185,32 @@ const onlyTagged = ref(false)
 const activityViews = ['list', 'card', 'timeline'] as const
 type ActivityView = (typeof activityViews)[number]
 
-// 视图记忆:仅接受已知视图值,非法值回退列表视图
+// 视图初值:后端 ui_state → localStorage → 列表(双读,兼容旧数据)
 function loadSavedView(): ActivityView {
-  const saved = localStorage.getItem(ACTIVITY_VIEW_KEY)
-  return saved && (activityViews as readonly string[]).includes(saved)
-    ? (saved as ActivityView)
-    : 'list'
+  const candidates = [store.uiState.activityView, localStorage.getItem(ACTIVITY_VIEW_KEY)]
+  for (const c of candidates) {
+    if (c && (activityViews as readonly string[]).includes(c)) return c as ActivityView
+  }
+  return 'list'
 }
 const view = ref<ActivityView>(loadSavedView())
-watch(view, (v) => localStorage.setItem(ACTIVITY_VIEW_KEY, v))
+let viewTouched = false
+// 切换视图:后端与 localStorage 双写
+watch(view, (v) => {
+  viewTouched = true
+  localStorage.setItem(ACTIVITY_VIEW_KEY, v)
+  void store.saveUiState({ view: v })
+})
+// 后端偏好可能晚于首次挂载到达:未被用户手动切换前同步一次
+watch(
+  () => store.uiState.activityView,
+  (v) => {
+    if (viewTouched) return
+    if (v && (activityViews as readonly string[]).includes(v) && v !== view.value) {
+      view.value = v as ActivityView
+    }
+  }
+)
 
 const views = [
   { key: 'list' as const, label: '列表' },

@@ -267,14 +267,19 @@ async function toggleMaximize() {
 // 双击拖拽区最大化/还原由 Tauri 原生 drag-region 处理(data-tauri-drag-region),
 // 不要再绑 @dblclick,否则会与原生 toggle 叠加成"最大化后立即还原"。
 
-// 明暗主题切换(localStorage 持久化,main.ts 已完成初始设置)
+// 明暗主题切换:localStorage(启动无闪烁)+ 后端 ui_state(跨进程记忆)双写
 const isDark = ref(document.documentElement.dataset.theme === 'dark')
 
-function toggleTheme() {
-  isDark.value = !isDark.value
-  const theme = isDark.value ? 'dark' : 'light'
+function applyTheme(theme: string) {
+  isDark.value = theme === 'dark'
   document.documentElement.dataset.theme = theme
+}
+
+function toggleTheme() {
+  const theme = isDark.value ? 'light' : 'dark'
+  applyTheme(theme)
   localStorage.setItem('traemate-theme', theme)
+  void store.saveUiState({ theme })
 }
 
 const currentPageTitle = computed(() => {
@@ -347,10 +352,13 @@ async function handleRefresh() {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
   store.init()
   void syncMaximized()
   void appWindow.onResized(() => { void syncMaximized() })
+  // 应用后端记住的主题(localStorage 在本机 WebView2 跨进程不保留)
+  const ui = await store.fetchUiState()
+  if (ui.theme === 'dark' || ui.theme === 'light') applyTheme(ui.theme)
   // 监听系统托盘"一键签到"菜单
   listen('tray-checkin', () => {
     handleCheckinAll()

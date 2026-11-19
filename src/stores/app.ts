@@ -171,6 +171,12 @@ export interface ActivityPayload {
   generatedAt: string
 }
 
+/** UI 偏好(后端 ui_state.json):视图记忆与主题记忆 */
+export interface UiState {
+  activityView?: string | null
+  theme?: string | null
+}
+
 export interface AppSettings {
   autoCheckin: boolean
   checkinTime: string
@@ -223,6 +229,8 @@ export const useAppStore = defineStore('app', () => {
   const activityAccounts = ref<ActivityAccount[]>([])
   const activityEvents = ref<ActivityTimelineEvent[]>([])
   const activityGeneratedAt = ref<string | null>(null)
+  // UI 偏好(后端持久化,解决 localStorage 跨进程不保留)
+  const uiState = ref<UiState>({})
 
   // 计算属性
   const enabledAccounts = computed(() => accounts.value.filter(a => a.enabled))
@@ -609,6 +617,36 @@ export const useAppStore = defineStore('app', () => {
     return acc
   }
 
+  // ===== UI 偏好(视图/主题后端持久化) =====
+
+  async function fetchUiState() {
+    try {
+      const res = await invoke<UiState>('ui_state_get')
+      uiState.value = res || {}
+      return uiState.value
+    } catch (e) {
+      console.error('获取 UI 偏好失败:', e)
+      return uiState.value
+    }
+  }
+
+  // 只提交传入的字段;后端只覆盖非空字段
+  async function saveUiState(patch: { view?: string; theme?: string }) {
+    try {
+      await invoke('ui_state_set', {
+        view: patch.view ?? null,
+        theme: patch.theme ?? null,
+      })
+      uiState.value = {
+        ...uiState.value,
+        ...(patch.view ? { activityView: patch.view } : {}),
+        ...(patch.theme ? { theme: patch.theme } : {}),
+      }
+    } catch (e) {
+      console.error('保存 UI 偏好失败:', e)
+    }
+  }
+
   // 初始化
   async function init() {
     loading.value = true
@@ -662,6 +700,7 @@ export const useAppStore = defineStore('app', () => {
     activityAccounts,
     activityEvents,
     activityGeneratedAt,
+    uiState,
     // 计算属性
     enabledAccounts,
     todayCheckedCount,
@@ -692,6 +731,8 @@ export const useAppStore = defineStore('app', () => {
     refreshInstances,
     fetchAccountActivity,
     updateAccountTags,
+    fetchUiState,
+    saveUiState,
     getTraeExePath,
     setTraeExePath,
     scanTraeExePath,

@@ -532,6 +532,17 @@ pub struct RemainingCreditsFile {
     pub updated_at: Option<String>,
 }
 
+/// UI 偏好(ui_state.json):视图记忆与主题记忆。
+/// 本机 WebView2 的 localStorage 无法跨进程保留,故改由后端落盘。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UiState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_view: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+}
+
 /// 按账号可归属消耗累计(仅统计逐日 per_account 齐全的可归属日)
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]

@@ -1336,6 +1336,40 @@ pub async fn account_activity_list(state: State<'_, AppState>) -> AppResult<serd
     }))
 }
 
+/// 读取 UI 偏好(视图/主题记忆);文件不存在返回默认值
+#[tauri::command]
+pub fn ui_state_get(state: State<'_, AppState>) -> crate::models::UiState {
+    crate::fs_utils::read_json(&state.data_path("ui_state.json"))
+}
+
+/// 写入 UI 偏好:只覆盖传入的非 None 字段,非法枚举值直接拒绝
+#[tauri::command]
+pub fn ui_state_set(
+    view: Option<String>,
+    theme: Option<String>,
+    state: State<'_, AppState>,
+) -> AppResult<()> {
+    if let Some(v) = view.as_deref() {
+        if !matches!(v, "list" | "card" | "timeline") {
+            return Err(AppError::Launch(format!("视图值无效: {v}")));
+        }
+    }
+    if let Some(t) = theme.as_deref() {
+        if !matches!(t, "dark" | "light") {
+            return Err(AppError::Launch(format!("主题值无效: {t}")));
+        }
+    }
+    let path = state.data_path("ui_state.json");
+    let mut st: crate::models::UiState = crate::fs_utils::read_json(&path);
+    if let Some(v) = view {
+        st.activity_view = Some(v);
+    }
+    if let Some(t) = theme {
+        st.theme = Some(t);
+    }
+    crate::fs_utils::write_json(&path, &st).map_err(AppError::Launch)
+}
+
 /// 更新账号标签(手动维护的用途标签)
 #[tauri::command]
 pub fn update_account_tags(
